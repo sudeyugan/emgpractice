@@ -128,20 +128,48 @@ def process_data():
         # 2. VAD 提取动作区
         mask = get_active_mask(raw_data) # 使用原始数据或滤波数据做检测均可
         
-        # 3. 遍历每个连续动作段
+        # 3. 提取所有候选动作片段
         labeled_mask, num_features = ndimage.label(mask)
+        candidate_segments = []
         
-        for segment_idx in range(1, num_features+1):
-            # 获取该段的索引
+        for segment_idx in range(1, num_features + 1):
             indices = np.where(labeled_mask == segment_idx)[0]
             if len(indices) < int((MIN_SEGMENT_MS/1000) * FS):
-                continue # 太短的忽略
+                continue
+            
+            candidate_segments.append({
+                'start': indices[0],
+                'end': indices[-1],
+                'center': (indices[0] + indices[-1]) / 2
+            })
+
+        # --- 核心：等间距过滤逻辑 ---
+        if len(candidate_segments) < 2:
+            final_segments = candidate_segments
+        else:
+            # 计算所有相邻片段的间距
+            centers = np.array([s['center'] for s in candidate_segments])
+            diffs = np.diff(centers)
+            expected_interval = np.median(diffs) # 以中位数作为标准节奏
+            
+            final_segments = [candidate_segments[0]]
+            for i in range(1, len(candidate_segments)):
+                prev_center = final_segments[-1]['center']
+                curr_center = candidate_segments[i]['center']
+                actual_diff = curr_center - prev_center
                 
-            start_pos = indices[0]
-            end_pos = indices[-1]
+                # 如果当前片段距离上一个合法片段太近（例如小于 0.7 倍标准间距），则视为干扰
+                if actual_diff > expected_interval * 0.7:
+                    final_segments.append(candidate_segments[i])
+                else:
+                    print(f"  [Filter] 剔除干扰片段 (如手腕翻转): {candidate_segments[i]['start']/FS:.2f}s")
+
+        # 4. 遍历过滤后的片段进行切片 (接原有的滑动窗口逻辑)
+        for seg in final_segments:
+            start_pos, end_pos = seg['start'], seg['end']
             segment_data = data_clean[start_pos:end_pos]
             
-            # 4. 段内归一化 (Z-Score)
+            # 段内归一化 (Z-Score)
             # 注意：在段内做归一化可以对抗不同力度的幅度差异
             seg_mean = np.mean(segment_data, axis=0)
             seg_std = np.std(segment_data, axis=0)

@@ -56,12 +56,52 @@ def process_signal(data, fs, low_cut, high_cut, smooth_ms, merge_ms, threshold_r
         
     return filtered, energy_smooth, threshold, mask
 
-# ================= 侧边栏：控制面板 =================
+# ================= 侧边栏：动态数据筛选 =================
 st.sidebar.header("📂 1. 数据筛选")
-data_root = st.sidebar.text_input("数据根目录", "data")
-subject = st.sidebar.text_input("测试者姓名 (Subject)", "charles")
-date_str = st.sidebar.text_input("日期 (Date)", "20250213")
-target_label = st.sidebar.number_input("动作标签 (DF Label)", min_value=0, value=1, step=1)
+
+# 1. 固定根目录
+data_root = "data"
+
+if not os.path.exists(data_root):
+    st.sidebar.error(f"未找到根目录: {data_root}")
+    st.stop()
+
+# 2. 选择测试者姓名 (Subject)
+subjects = [d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))]
+if not subjects:
+    st.sidebar.warning("data 目录下没有文件夹")
+    st.stop()
+subject = st.sidebar.selectbox("选择测试者姓名 (Subject)", sorted(subjects))
+
+# 3. 选择日期 (Date)
+subject_path = os.path.join(data_root, subject)
+dates = [d for d in os.listdir(subject_path) if os.path.isdir(os.path.join(subject_path, d))]
+if not dates:
+    st.sidebar.warning(f"{subject} 目录下没有日期文件夹")
+    st.stop()
+date_str = st.sidebar.selectbox("选择日期 (Date)", sorted(dates))
+
+# 4. 自动扫描该日期文件夹下的所有标签 (DF Label)
+# 根据 preprocess.py 的文件路径规范搜索
+search_path = os.path.join(data_root, subject, date_str, "RAW_EMG*.csv")
+all_files_in_folder = glob.glob(search_path)
+
+if not all_files_in_folder:
+    st.sidebar.warning(f"该目录下未发现 RAW_EMG 文件")
+    st.stop()
+
+# 提取所有存在的标签
+available_labels = set()
+for f in all_files_in_folder:
+    label = parse_filename(os.path.basename(f)) # 使用已有的解析函数
+    if label is not None:
+        available_labels.add(label)
+
+if not available_labels:
+    st.sidebar.error("无法从文件名中解析出动作标签")
+    st.stop()
+
+target_label = st.sidebar.selectbox("选择动作标签 (DF Label)", sorted(list(available_labels)))
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎛️ 2. 算法参数微调")
@@ -77,6 +117,10 @@ st.sidebar.subheader("VAD (活动检测) 参数")
 thresh_ratio = st.sidebar.slider("阈值系数 (越小越灵敏)", 0.05, 0.50, 0.15, 0.01)
 smooth_ms = st.sidebar.slider("能量平滑窗口 (ms)", 10, 500, 200, 10)
 merge_ms = st.sidebar.slider("合并间隙 (ms)", 0, 1000, 300, 50)
+st.sidebar.markdown("---")
+st.sidebar.subheader("📅 节奏过滤参数")
+use_rhythm_filter = st.sidebar.checkbox("开启等间距过滤", value=True)
+interval_ratio = st.sidebar.slider("最小间距比例 (Interval Ratio)", 0.1, 0.9, 0.7, 0.05)
 
 # ================= 主界面 =================
 st.title("⚡ EMG 信号切分可视化")
@@ -111,8 +155,37 @@ if selected_file:
             smooth_ms, merge_ms, thresh_ratio
         )
         
-        # 计算切分统计
-        labeled_mask, num_segments = ndimage.label(mask)
+        labeled_mask, num_raw_segments = ndimage.label(mask)
+        
+        if use_rhythm_filter and num_raw_segments > 1:
+            # 提取中心点
+            centers = []
+            for i in range(1, num_raw_segments + 1):
+                idx = np.where(labeled_mask == i)[0]
+                centers.append((idx[0] + idx[-1]) / 2)
+            
+            # 计算基准节奏
+            diffs = np.diff(centers)
+            median_interval = np.median(diffs)
+            
+            # 重新生成过滤后的 mask
+            new_mask = np.zeros_like(mask)
+            valid_ids = [1] # 默认保留第一个
+            last_valid_center = centers[0]
+            
+            for i in range(1, num_raw_segments):
+                if (centers[i] - last_valid_center) > median_interval * interval_ratio:
+                    valid_ids.append(i + 1)
+                    last_valid_center = centers[i]
+            
+            # 只保留 valid_ids 中的区域
+            for vid in valid_ids:
+                new_mask[labeled_mask == vid] = True
+            
+            mask = new_mask
+            labeled_mask, num_segments = ndimage.label(mask) # 更新最终显示的片段数
+        else:
+            num_segments = num_raw_segments
         
     # ================= 绘图区域 =================
     
@@ -146,27 +219,39 @@ if selected_file:
     
     st.pyplot(fig)
     
-    # ================= 详细切片展示 =================
+    # ================= 详细切片展示 (修改部分) =================
     st.subheader("🔍 动作切片详情")
-    
+
     if num_segments > 0:
-        # 让用户选择查看第几个切片
         seg_id = st.slider("查看第几个动作片段?", 1, num_segments, 1)
         
         indices = np.where(labeled_mask == seg_id)[0]
         start, end = indices[0], indices[-1]
-        duration_ms = (end - start) / fs * 1000
         
-        st.write(f"**片段 #{seg_id}**: 时间 {start/fs:.2f}s - {end/fs:.2f}s (持续 {duration_ms:.0f} ms)")
+        # 提取选中的片段数据 (以 CH1 为例，或者让用户选通道)
+        seg_data = filtered_data[start:end] 
         
-        # 画出这个具体的切片
-        fig_seg, ax_seg = plt.subplots(figsize=(10, 4))
-        seg_data = filtered_data[start:end]
-        ax_seg.plot(seg_data)
-        ax_seg.set_title(f"Segment #{seg_id} (All 5 Channels)")
-        st.pyplot(fig_seg)
+        col1, col2 = st.columns(2)
         
-        if duration_ms < 300:
-            st.error("⚠️ 警告：该片段过短，批量处理时可能会被丢弃！")
-    else:
-        st.error("未检测到任何动作！请尝试调低阈值系数。")
+        with col1:
+            st.write(f"**时域波形 (Segment #{seg_id})**")
+            fig_seg, ax_seg = plt.subplots(figsize=(6, 4))
+            ax_seg.plot(seg_data) # 画出所有通道
+            ax_seg.set_xlabel("Samples")
+            ax_seg.set_ylabel("Amplitude")
+            st.pyplot(fig_seg)
+
+        with col2:
+            st.write(f"**时频分析 (STFT - Channel 1)**")
+            # 计算 STFT
+            # nperseg 决定了时间/频率的分辨率平衡，通常取 64 或 128
+            f_stft, t_stft, Zxx = signal.stft(seg_data[:, 0], fs=fs, nperseg=64)
+            
+            fig_stft, ax_stft = plt.subplots(figsize=(6, 4))
+            # 使用 pcolormesh 绘制能量分布
+            pcm = ax_stft.pcolormesh(t_stft, f_stft, np.abs(Zxx), shading='gouraud', cmap='jet')
+            ax_stft.set_ylabel('Frequency [Hz]')
+            ax_stft.set_xlabel('Time [sec]')
+            ax_stft.set_ylim(0, 500) # 重点关注 0-500Hz
+            fig_stft.colorbar(pcm, ax=ax_stft, label='Intensity')
+            st.pyplot(fig_stft)
