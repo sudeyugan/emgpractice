@@ -83,13 +83,17 @@ class StreamlitKerasCallback(Callback):
 
 reduce_lr = ReduceLROnPlateau(
     monitor='val_loss',    # 监控验证集的损失值
-    factor=0.5,             # 学习率调整倍数：当触发时，新学习率 = 旧学习率 * 0.5
+    factor=0.2,             # 学习率调整倍数：当触发时，新学习率 = 旧学习率 * 0.5
     patience=5,             # 耐心值：如果连续 5 个 epoch 验证集损失都没有改善，则触发
     min_lr=1e-6,            # 学习率下限：防止学习率被减到过小
     verbose=1               # 触发时在终端打印消息
 )
 
 st.set_page_config(layout="wide", page_title="EMG 训练工作站")
+if 'trained_model' not in st.session_state:
+    st.session_state['trained_model'] = None
+if 'train_history' not in st.session_state:
+    st.session_state['train_history'] = None
 
 # ================= 1. 文件扫描逻辑 =================
 @st.cache_data
@@ -169,9 +173,37 @@ def smart_split(X, y, groups, strategy, test_size=0.2, manual_target=None):
         
     return np.array(train_idx), np.array(test_idx)
 
+def get_few_shot_split(X, y, groups, n_samples_per_class):
+    """
+    为每个类别提取固定数量的样本用于微调，其余用于测试
+    """
+    train_idx = []
+    test_idx = []
+    unique_labels = np.unique(y)
+    
+    for label in unique_labels:
+        label_indices = np.where(y == label)[0]
+        # 随机打乱
+        np.random.shuffle(label_indices)
+        # 取前 N 个作为微调样本
+        train_idx.extend(label_indices[:n_samples_per_class])
+        # 剩下的作为测试
+        test_idx.extend(label_indices[n_samples_per_class:])
+        
+    return np.array(train_idx), np.array(test_idx)
+
 # ================= 界面布局 =================
 
 st.title("🧠 EMG 交互式训练系统")
+
+# train_gui.py 侧边栏
+st.sidebar.header("🚀 训练模式")
+train_mode = st.sidebar.radio("选择模式", ["从零开始训练", "基于基模型微调 (Few-shot)"])
+
+base_model_path = None
+if train_mode == "基于基模型微调 (Few-shot)":
+    base_model_path = st.sidebar.file_uploader("上传基模型 (.h5)", type=["h5"])
+    num_finetune_samples = st.sidebar.slider("每个类别用于微调的样本数", 1, 10, 5)
 
 with st.sidebar:
     st.header("1. 数据选择")
@@ -184,48 +216,102 @@ with st.sidebar:
     structure, file_map = scan_data_folder(DATA_ROOT)
     
 # --- 级联选择器 ---
-    # 1. 选择对象 (Subject)
-    # 逻辑：默认选中第一个
+
+    def render_multiselect_with_all(label, options, key_name, default_first=False):
+        """
+        label: 标题
+        options: 候选项列表
+        key_name: session_state 的键名
+        default_first: 是否默认选中第一个
+        """
+        # 1. 确保 Session State 初始化
+        if key_name not in st.session_state:
+            if default_first and options:
+                st.session_state[key_name] = options[:1]
+            else:
+                st.session_state[key_name] = []
+        
+        # 2. 数据清洗 (防止选项变化后，残留了无效的选中项)
+        current_selection = st.session_state[key_name]
+        valid_selection = [x for x in current_selection if x in options]
+        if len(valid_selection) != len(current_selection):
+            st.session_state[key_name] = valid_selection
+            current_selection = valid_selection
+            
+        # 3. 计算当前是否“已全选”，用于设置 Checkbox 的初始状态
+        is_all_selected = (len(current_selection) == len(options)) and (len(options) > 0)
+        
+        # 4. 定义全选回调函数
+        def toggle_all():
+            # 获取 Checkbox 的新状态 (注意：这里的 key 是拼接了 _all 的)
+            if st.session_state[key_name + '_all']:
+                st.session_state[key_name] = options # 全选
+            else:
+                st.session_state[key_name] = []      # 全不选
+
+        # 5. 渲染 UI：使用列布局，让“标题”和“全选框”在同一行
+        c1, c2 = st.columns([0.7, 0.3], gap="small")
+        with c1:
+            # 手动渲染标题，加粗
+            st.markdown(f"**{label}**")
+        with c2:
+            # 渲染全选框 (无标签，只显示框，节省空间)
+            st.checkbox(
+                "全选", 
+                value=is_all_selected, 
+                key=key_name + '_all', # 独立的 key
+                on_change=toggle_all,   # 绑定回调
+                help=f"勾选以选中所有 {label}"
+            )
+            
+        # 6. 渲染多选框 (隐藏自带的 Label)
+        return st.multiselect(
+            label=label, # 这个 label 仅用于 accessibility，不可见
+            options=options,
+            key=key_name,
+            label_visibility="collapsed" # 隐藏自带标题，因为上面已经画了
+        )
+
+    # ================= 1. 选择对象 (Subject) =================
     all_subjects = sorted(structure.keys())
-    selected_subjects = st.multiselect(
-        "选择测试者 (Subjects)", 
-        all_subjects, 
-        default=all_subjects[:1] # 保持不变，已经是默认选第一个
+    
+    selected_subjects = render_multiselect_with_all(
+        label="选择测试者 (Subjects)",
+        options=all_subjects,
+        key_name='selected_subjects_key',
+        default_first=True
     )
     
-    # 2. 选择日期 (Date) - 基于选中的对象
+    # ================= 2. 选择日期 (Date) =================
     available_dates = set()
     for s in selected_subjects:
         if s in structure:
             available_dates.update(structure[s].keys())
-    
-    # 排序日期列表
     sorted_dates = sorted(list(available_dates))
     
-    # 修改点：default=sorted_dates[:1] 表示默认只选第一个
-    selected_dates = st.multiselect(
-        "选择日期 (Dates)", 
-        sorted_dates, 
-        default=sorted_dates[:1] 
+    selected_dates = render_multiselect_with_all(
+        label="选择日期 (Dates)",
+        options=sorted_dates,
+        key_name='selected_dates_key',
+        default_first=True
     )
     
-    # 3. 选择动作 (Labels) - 基于选中的对象和日期
+    # ================= 3. 选择动作 (Labels) =================
     available_labels = set()
     for s in selected_subjects:
         for d in selected_dates:
             if s in structure and d in structure[s]:
                 available_labels.update(structure[s][d])
-    
-    # 排序标签列表
     sorted_labels = sorted(list(available_labels))
     
-    # 修改点：default=sorted_labels[:1] 表示默认只选第一个
-    selected_labels = st.multiselect(
-        "选择动作 ID (Labels)", 
-        sorted_labels, 
-        default=sorted_labels[:1]
+    selected_labels = render_multiselect_with_all(
+        label="选择动作 ID (Labels)",
+        options=sorted_labels,
+        key_name='selected_labels_key',
+        default_first=True
     )
 
+    
     st.markdown("---")
     
     # 统计选中文件
@@ -310,8 +396,8 @@ with st.sidebar:
 
     st.markdown("---") 
     epochs = st.number_input("Epochs", 10, 200, 50)
-    batch_size = st.selectbox("Batch Size", [16, 32, 64], index=1)
-    test_size = st.slider("测试集比例", 0.1, 0.5, 0.2)
+    batch_size = st.selectbox("Batch Size", [32, 64, 128, 256, 512, 1024, 2048], index=2)
+    test_size = st.slider("测试集比例", 0.01, 0.5, 0.2)
     
     run_btn = st.button("🚀 开始处理并训练", type="primary")
 # ================= 主逻辑区域 =================
@@ -343,40 +429,56 @@ if run_btn and target_files:
     # --- 2. 训练阶段 ---
     st.subheader("2. 模型训练")
     
-    train_idx, test_idx = smart_split(X, y, groups, selected_strategy, test_size)
-    
+    # 【新增位置】：根据模式选择切分策略
+    if train_mode == "基于基模型微调 (Few-shot)":
+        # 使用刚才定义的 Few-shot 切分函数
+        train_idx, test_idx = get_few_shot_split(X, y, num_finetune_samples)
+        selected_strategy = f"Few-shot (每类 {num_finetune_samples} 样本)"
+    else:
+        # 原有的 smart_split 逻辑
+        train_idx, test_idx = smart_split(X, y, groups, selected_strategy, test_size)
+
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
-
-    st.info(f"数据集划分结果 ({selected_strategy}):\n"
-            f"- 训练集: {X_train.shape[0]} 样本\n"
-            f"- 测试集: {X_test.shape[0]} 样本")
-
-    # 重新映射标签 (保持不变)
+    
+    # ... 标签映射代码 ...
     unique_labels = np.unique(y)
+    
+    # 2. 计算分类数量 
+    num_classes = len(unique_labels) 
+    # 3. 标签映射 (将原始标签 1,3,5 映射为 0,1,2 用于训练)
     label_map = {original: new for new, original in enumerate(unique_labels)}
     y_train_mapped = np.array([label_map[i] for i in y_train])
     y_test_mapped = np.array([label_map[i] for i in y_test])
-    
-    # 检查测试集是否包含训练集没有的标签 (防止报错)
-    if len(np.unique(y_test)) < len(unique_labels) and "跨文件" in selected_strategy:
-        st.warning("⚠️ 注意：测试集中某些动作类别可能缺失，这通常是因为选中的文件太少，导致按文件切分时把某个动作的所有文件都分到了训练集。")
-    
-    num_classes = len(unique_labels)
-    
-    st.subheader(f"正在构建模型: {model_type.split(':')[0]}")
-    
-    input_shape = (X.shape[1], X.shape[2])
-    
-    # === 根据选择调用不同的模型构建函数 ===
-    if "Lite" in model_type:
-        model = build_simple_cnn(input_shape=input_shape, num_classes=num_classes)
-        st.caption("已加载 Simple CNN：结构轻量，专注局部特征。")
+
+    # 模型构建/加载逻辑
+    if train_mode == "基于基模型微调 (Few-shot)":
+        if base_model_path is not None:
+            # 加载已有的模型文件
+            with open("temp_model.h5", "wb") as f:
+                f.write(base_model_path.getbuffer())
+            model = tf.keras.models.load_model("temp_model.h5")
+            
+            # 冻结卷积层，只训练最后两层全连接层
+            for layer in model.layers[:-2]:
+                layer.trainable = False
+            
+            # 使用较小的学习率进行微调
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), 
+                          loss='sparse_categorical_crossentropy', 
+                          metrics=['accuracy'])
+            st.success("基模型加载成功，已冻结特征提取层。")
+        else:
+            st.error("请先上传基模型！")
+            st.stop()
     else:
-        model = build_advanced_crnn(input_shape=input_shape, num_classes=num_classes)
-        st.caption("已加载 Multi-Scale CRNN：多尺度视野 + 时序记忆。")
-        
-    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        # 原有的模型构建逻辑 (build_simple_cnn 或 build_advanced_crnn)
+        input_shape = (X.shape[1], X.shape[2])
+        if "Lite" in model_type:
+            model = build_simple_cnn(input_shape=input_shape, num_classes=num_classes)
+        else:
+            model = build_advanced_crnn(input_shape=input_shape, num_classes=num_classes)
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
     st.write("---")
     st.caption("训练监控面板")
@@ -401,7 +503,7 @@ if run_btn and target_files:
             callbacks=[
                 EarlyStopping(patience=10, restore_best_weights=True), 
                 reduce_lr, 
-                st_callback  # <--- 重点：把我们刚才写的 callback 加进去
+                st_callback 
             ],
             verbose=0 # 保持 0，因为我们自己接管了输出
         )
@@ -481,10 +583,32 @@ if run_btn and target_files:
         st.metric("窗口级准确率 (Window Acc)", f"{acc*100:.2f}%", help="单个250ms切片的准确率")
     with col_m2:
         st.metric("投票后准确率 (Segment Acc)", f"{segment_acc*100:.2f}%", delta=f"{(segment_acc-acc)*100:.2f}%")
-    # 保存模型选项
-    if st.button("💾 保存当前模型"):
-        model.save("custom_selection_model.h5")
-        st.toast("模型已保存为 custom_selection_model.h5")
+
+    st.session_state['trained_model'] = model
+    st.success("训练完成并已缓存！")
+
+if st.session_state['trained_model'] is not None:
+    st.markdown("---")
+    st.subheader("💾 模型保存")
+    
+    # 获取缓存的模型
+    model_to_save = st.session_state['trained_model']
+    
+    col_save1, col_save2 = st.columns([0.5, 0.5])
+    
+    with col_save1:
+        save_name = st.text_input("模型文件名", value="my_emg_model.h5")
+        
+    with col_save2:
+        st.write("") # 占位对齐
+        st.write("") 
+        if st.button("确认保存模型"):
+            try:
+                model_to_save.save(save_name)
+                st.success(f"✅ 模型已成功保存至: {os.path.abspath(save_name)}")
+                st.balloons() # 撒花确认
+            except Exception as e:
+                st.error(f"保存失败: {e}")
 
 elif run_btn and not target_files:
     st.warning("请先在左侧选择数据！")
