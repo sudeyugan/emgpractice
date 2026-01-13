@@ -51,12 +51,11 @@ def get_active_mask(data):
 
 def process_selected_files(file_list, progress_callback=None):
     """
-    处理选中的文件列表
-    :param file_list: 文件的完整路径列表
-    :param progress_callback:Streamlit 的进度条回调函数
+    处理选中的文件列表，并返回来源信息
     """
     X_list = []
     y_list = []
+    groups_list = [] # 新增：用于记录每个窗口属于哪个文件
     
     total = len(file_list)
     
@@ -66,7 +65,7 @@ def process_selected_files(file_list, progress_callback=None):
             
         try:
             # 1. 解析标签
-            _, _, label, _ = parse_filename_info(f)
+            subject, date, label, _ = parse_filename_info(f) # 确保 parse_filename_info 已正确定义
             if label is None: continue
             
             # 2. 读取数据
@@ -74,7 +73,7 @@ def process_selected_files(file_list, progress_callback=None):
             cols = [c for c in df.columns if 'CH' in c]
             raw_data = df[cols].values
             
-            # 3. 滤波
+            # 3. 滤波 (建议放在切片前)
             b, a = signal.butter(4, [20, 450], btype='bandpass', fs=FS)
             data_clean = signal.filtfilt(b, a, raw_data, axis=0)
             
@@ -88,9 +87,6 @@ def process_selected_files(file_list, progress_callback=None):
                 if len(indices) < int((MIN_SEGMENT_MS/1000) * FS):
                     continue
                 
-                # 简单过滤：这里省略了 preprocess.py 中复杂的节奏过滤，
-                # 如果需要严格过滤，可以将那部分代码也搬过来。
-                
                 # 6. 切片
                 segment_data = data_clean[indices[0]:indices[-1]]
                 
@@ -103,13 +99,15 @@ def process_selected_files(file_list, progress_callback=None):
                 for w_start in range(0, len(segment_norm) - WINDOW_SIZE, STRIDE_SIZE):
                     w_end = w_start + WINDOW_SIZE
                     window = segment_norm[w_start:w_end]
+                    
                     X_list.append(window)
                     y_list.append(label)
+                    groups_list.append(f) # 记录该样本的文件来源路径
                     
         except Exception as e:
             print(f"Error processing {f}: {e}")
             
     if len(X_list) == 0:
-        return np.array([]), np.array([])
+        return np.array([]), np.array([]), np.array([]) # 修改返回值数量
         
-    return np.array(X_list), np.array(y_list)
+    return np.array(X_list), np.array(y_list), np.array(groups_list)
