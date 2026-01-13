@@ -242,16 +242,102 @@ if selected_file:
             st.pyplot(fig_seg)
 
         with col2:
-            st.write(f"**时频分析 (STFT - Channel 1)**")
-            # 计算 STFT
-            # nperseg 决定了时间/频率的分辨率平衡，通常取 64 或 128
-            f_stft, t_stft, Zxx = signal.stft(seg_data[:, 0], fs=fs, nperseg=64)
+            st.markdown("时频分析 (STFT)")
             
+            # --- 交互控制区 (改动：移至侧边栏) ---
+            st.sidebar.markdown("---")
+            st.sidebar.subheader("🔍 STFT 详细分析参数")
+            
+            # 1. 通道选择
+            stft_ch_idx = st.sidebar.selectbox(
+                "STFT 选择通道", 
+                range(seg_data.shape[1]), 
+                format_func=lambda x: f"Channel {x+1}"
+            )
+            
+            # 2. 窗口大小 (nperseg)
+            # 较小的值 = 时间分辨率高，频率分辨率低
+            # 较大的值 = 时间分辨率低，频率分辨率高
+            nperseg = st.sidebar.selectbox(
+                "STFT 窗口大小 (nperseg)", 
+                [32, 64, 128, 256], 
+                index=1,
+                help="小窗口提升时间分辨率，大窗口提升频率分辨率"
+            )
+            
+            # 3. 重叠 (Overlap)
+            # 通常取窗口的一半或更多，使图像更平滑
+            noverlap = st.sidebar.slider("STFT 重叠点数", 0, nperseg-1, nperseg//2)
+            
+            # 4. 显示设置
+            use_log_scale = st.sidebar.checkbox("STFT 使用对数刻度 (dB)", value=True, help="能更清晰地看到低能量的频率成分")
+            max_freq_view = st.sidebar.slider("STFT 显示最大频率 (Hz)", 50, int(fs/2), 500)
+
+            # --- 计算 STFT ---
+            f_stft, t_stft, Zxx = signal.stft(
+                seg_data[:, stft_ch_idx], 
+                fs=fs, 
+                nperseg=nperseg, 
+                noverlap=noverlap
+            )
+            
+            # 处理幅值
+            magnitude = np.abs(Zxx)
+            if use_log_scale:
+                # 转换为 dB，加一个微小量防止 log(0)
+                magnitude = 20 * np.log10(magnitude + 1e-6)
+                cbar_label = 'Intensity (dB)'
+            else:
+                cbar_label = 'Intensity (Amplitude)'
+
+            # --- 绘图 ---
             fig_stft, ax_stft = plt.subplots(figsize=(6, 4))
-            # 使用 pcolormesh 绘制能量分布
-            pcm = ax_stft.pcolormesh(t_stft, f_stft, np.abs(Zxx), shading='gouraud', cmap='jet')
+            
+            # 使用 pcolormesh 绘制
+            # shading='gouraud' 会让图像更平滑好看
+            pcm = ax_stft.pcolormesh(t_stft, f_stft, magnitude, shading='gouraud', cmap='jet')
+            
             ax_stft.set_ylabel('Frequency [Hz]')
             ax_stft.set_xlabel('Time [sec]')
-            ax_stft.set_ylim(0, 500) # 重点关注 0-500Hz
-            fig_stft.colorbar(pcm, ax=ax_stft, label='Intensity')
+            ax_stft.set_ylim(0, max_freq_view) # 动态限制频率范围
+            ax_stft.set_title(f'Channel {stft_ch_idx+1} Spectrogram')
+            
+            # 颜色条
+            fig_stft.colorbar(pcm, ax=ax_stft, label=cbar_label)
             st.pyplot(fig_stft)
+
+    # ================= 新增：所有切片缩略图概览 =================
+    st.markdown("---")
+    st.subheader("🖼️ 所有切片缩略图概览 (Gallery Mode)")
+    
+    show_gallery = st.checkbox("展开查看所有动作切片", value=False)
+    
+    if show_gallery and num_segments > 0:
+        cols_count = st.slider("每行显示数量", 3, 15, 5)
+        
+        # 这里的逻辑是：分块遍历，每次处理一行
+        for i in range(1, num_segments + 1, cols_count):
+            cols = st.columns(cols_count)
+            
+            # 在当前行的一组 columns 中填充内容
+            for j in range(cols_count):
+                current_seg_id = i + j
+                
+                if current_seg_id <= num_segments:
+                    with cols[j]:
+                        # 1. 提取当前片段数据
+                        indices = np.where(labeled_mask == current_seg_id)[0]
+                        if len(indices) > 0:
+                            s, e = indices[0], indices[-1]
+                            # 提取滤波后的数据用于展示
+                            seg_thumb = filtered_data[s:e]
+                            
+                            # 2. 绘制微型图
+                            # figsize设置得较小，去除多余元素
+                            fig_thumb, ax_thumb = plt.subplots(figsize=(3, 2))
+                            ax_thumb.plot(seg_thumb, linewidth=0.8)
+                            ax_thumb.set_title(f"#{current_seg_id}", fontsize=10)
+                            ax_thumb.axis('off') # 关闭坐标轴，让看起来更像缩略图
+                            
+                            st.pyplot(fig_thumb)
+                            plt.close(fig_thumb) # 显式关闭，防止内存泄漏
