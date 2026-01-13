@@ -18,10 +18,20 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import GroupShuffleSplit
+from tensorflow.keras.callbacks import ReduceLROnPlateau
 
 # 引入我们自定义的模块
 import data_loader
 from model import build_simple_cnn, build_advanced_crnn
+
+
+reduce_lr = ReduceLROnPlateau(
+    monitor='val_loss',    # 监控验证集的损失值
+    factor=0.5,             # 学习率调整倍数：当触发时，新学习率 = 旧学习率 * 0.5
+    patience=5,             # 耐心值：如果连续 5 个 epoch 验证集损失都没有改善，则触发
+    min_lr=1e-6,            # 学习率下限：防止学习率被减到过小
+    verbose=1               # 触发时在终端打印消息
+)
 
 st.set_page_config(layout="wide", page_title="EMG 训练工作站")
 
@@ -277,7 +287,10 @@ if run_btn and target_files:
             epochs=epochs,
             batch_size=batch_size,
             validation_data=(X_test, y_test_mapped),
-            callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+            callbacks=[
+                EarlyStopping(patience=10, restore_best_weights=True), # 原有
+                reduce_lr  # 新增
+            ],
             verbose=0 # 隐藏控制台输出
         )
     
