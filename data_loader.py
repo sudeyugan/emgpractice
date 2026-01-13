@@ -8,9 +8,7 @@ import re
 # ================= 默认参数 (已根据图片和 preprocess.py 对齐) =================
 FS = 1000                   # 采样率 1000Hz
 WINDOW_MS = 250             # 窗口 250ms
-STRIDE_MS = 100             # 步长 100ms
 WINDOW_SIZE = int(FS * (WINDOW_MS / 1000))
-STRIDE_SIZE = int(FS * (STRIDE_MS / 1000))
 
 # VAD (活动检测) 参数
 VAD_SMOOTH_MS = 200         # 能量平滑窗口 (ms)
@@ -59,19 +57,36 @@ def get_active_mask(data):
     mask = ndimage.binary_closing(mask, structure=np.ones(gap_samples))
     return mask
 
-def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=True):
+def add_noise(data, noise_level=0.01):
+    """加入高斯白噪声"""
+    noise = np.random.normal(0, noise_level, data.shape)
+    return data + noise
+
+def scale_amplitude(data, scale_range=(0.8, 1.2)):
+    """随机幅度缩放"""
+    factor = np.random.uniform(scale_range[0], scale_range[1])
+    return data * factor
+
+def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=True, stride_ms=100, augment_config=None):
     """
-    处理选中的文件列表，并集成节奏过滤逻辑
+    augment_config: dict, e.g. {'enable_noise': True, 'noise_level': 0.02, 'enable_scaling': True}
     """
+    if augment_config is None:
+        augment_config = {}
+        
     X_list = []
     y_list = []
-    groups_list = [] # 用于记录每个窗口属于哪个文件
-    offset = int(25 * (FS / 1000))
+    groups_list = [] 
+    
+    # 动态计算步长大小
+    current_stride_size = int(FS * (stride_ms / 1000))
+    if current_stride_size < 1: current_stride_size = 1
+    
     total = len(file_list)
     
     for idx, f in enumerate(file_list):
         if progress_callback:
-            progress_callback(idx / total, f"正在处理: {os.path.basename(f)}")
+            progress_callback(idx / total, f"处理中: {os.path.basename(f)}")
             
         try:
             # 1. 解析信息
@@ -119,26 +134,44 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
             else:
                 final_segments = candidate_segments
             
-            # 6. 遍历最终确定的片段进行滑动窗口切片
+            # 6. 遍历最终片段进行切片
             for seg in final_segments:
-                new_start = seg['start'] + offset
-                new_end = seg['end'] - offset
-                segment_data = data_clean[new_start:new_end]
-                
-                # 段内 Z-Score 归一化
+
+                segment_data = data_clean[seg['start']:seg['end']]
+
+                # 段内归一化 (Z-Score) - 这是一个很好的实践，保持住
                 seg_mean = np.mean(segment_data, axis=0)
                 seg_std = np.std(segment_data, axis=0)
                 segment_norm = (segment_data - seg_mean) / (seg_std + 1e-6)
                 
-                # 滑动窗口切片
-                for w_start in range(0, len(segment_norm) - WINDOW_SIZE, STRIDE_SIZE):
+                # 滑动窗口切片 (使用动态 stride)
+                for w_start in range(0, len(segment_norm) - WINDOW_SIZE, current_stride_size):
                     w_end = w_start + WINDOW_SIZE
                     window = segment_norm[w_start:w_end]
                     
+                    # === A. 保存原始窗口 ===
                     X_list.append(window)
                     y_list.append(label)
-                    groups_list.append(f)
+                    groups_list.append(f) # 记录这个窗口来自哪个文件
                     
+                    # === B. 数据增强 (生成额外的窗口) ===
+                    # 只有在 augment_config 存在且非空时执行
+                    if augment_config:
+                        # 1. 随机幅度缩放
+                        if augment_config.get('enable_scaling', False):
+                            aug_window = scale_amplitude(window, scale_range=(0.8, 1.2))
+                            X_list.append(aug_window)
+                            y_list.append(label)
+                            groups_list.append(f)
+                            
+                        # 2. 高斯噪声 (可以在缩放的基础上加，也可以单独加，这里演示独立加)
+                        if augment_config.get('enable_noise', False):
+                            # 注意：Z-Score后的数据通常在 -3 到 3 之间，0.05 的噪声已经很明显了
+                            aug_window = add_noise(window, noise_level=0.05) 
+                            X_list.append(aug_window)
+                            y_list.append(label)
+                            groups_list.append(f)
+
         except Exception as e:
             print(f"Error processing {f}: {e}")
             
