@@ -67,6 +67,44 @@ def scale_amplitude(data, scale_range=(0.8, 1.2)):
     factor = np.random.uniform(scale_range[0], scale_range[1])
     return data * factor
 
+def time_warp(data, sigma=0.2, knot=4):
+    """
+    时间扭曲：通过插值改变信号局部的时间流速
+    (模拟动作忽快忽慢)
+    """
+    orig_steps = np.arange(data.shape[0])
+    
+    random_warps = np.random.normal(loc=1.0, scale=sigma, size=(knot+2, data.shape[1]))
+    warp_steps = (np.linspace(0, data.shape[0]-1., num=knot+2))
+    
+    ret = np.zeros_like(data)
+    for i in range(data.shape[1]):
+        time_warp = np.interp(orig_steps, np.linspace(0, data.shape[0]-1., num=knot+2), random_warps[:, i])
+        cum_warp = np.cumsum(time_warp)
+        scale = (data.shape[0]-1) / cum_warp[-1]
+        new_times = cum_warp * scale
+        ret[:, i] = np.interp(orig_steps, new_times, data[:, i])
+    return ret
+
+def time_shift(data, shift_limit=0.1):
+    """
+    时间平移：随机左右移动窗口
+    """
+    shift_amt = int(data.shape[0] * shift_limit * np.random.uniform(-1, 1))
+    return np.roll(data, shift_amt, axis=0)
+
+def channel_mask(data, mask_prob=0.15):
+    """
+    通道遮挡：随机把某一列（通道）置零
+    (模拟电极接触不良，强迫模型看整体)
+    """
+    temp = data.copy()
+    if np.random.random() < mask_prob:
+        # 随机选一个通道置零
+        c = np.random.randint(0, data.shape[1])
+        temp[:, c] = 0
+    return temp
+
 def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=True, stride_ms=100, augment_config=None):
     """
     augment_config: dict, e.g. {'enable_noise': True, 'noise_level': 0.02, 'enable_scaling': True}

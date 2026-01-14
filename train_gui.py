@@ -197,15 +197,20 @@ def get_few_shot_split(X, y, n_samples_per_class):
 st.title("🧠 EMG 交互式训练系统")
 
 # train_gui.py 侧边栏
-st.sidebar.header("🚀 训练模式")
-train_mode = st.sidebar.radio("选择模式", ["从零开始训练", "基于基模型微调 (Few-shot)"])
-
-base_model_path = None
-if train_mode == "基于基模型微调 (Few-shot)":
-    base_model_path = st.sidebar.file_uploader("上传基模型 (.h5)", type=["h5"])
-    num_finetune_samples = st.sidebar.slider("每个类别用于微调的样本数", 1, 10, 5)
-
 with st.sidebar:
+    st.header("🚀 训练模式")
+    train_mode = st.radio("选择模式", ["从零开始训练", "基于基模型微调 (Few-shot)"])
+
+    # 1. 模式专属配置
+    if train_mode == "基于基模型微调 (Few-shot)":
+        base_model_path = st.file_uploader("上传基模型 (.h5)", type=["h5"])
+        num_finetune_samples = st.slider("每个类别用于微调的样本数", 1, 10, 5)
+        # 为微调模式设置默认变量，防止后面代码找不到变量
+        model_type = None
+        selected_strategy = "Few-shot"
+        test_size = 0.0
+        manual_val_target = None
+
     st.header("1. 数据选择")
     DATA_ROOT = "data"
     
@@ -343,61 +348,45 @@ with st.sidebar:
             'enable_scaling': enable_scaling,
             'enable_noise': enable_noise
         }
-    st.markdown("---")
-    st.markdown("##### 🧠 模型架构选择")
-    model_type = st.selectbox(
-        "选择模型核心",
-        ["Lite: Simple CNN (推荐单人)", "Pro: Multi-Scale CRNN (推荐多人/跨天)"],
-        index=0,
-        help="Lite版：训练快，适合小样本；Pro版：抗干扰强，需要较多数据。"
-    )
+    # 2. 动态显示：仅在从零开始时显示的选项
+    if train_mode == "从零开始训练":
+        st.markdown("---")
+        st.markdown("##### 🧠 模型架构选择")
+        model_type = st.selectbox(
+            "选择模型核心",
+            ["Lite: Simple CNN (推荐单人)", "Pro: Multi-Scale CRNN (推荐多人/跨天)"],
+            index=0
+        )
 
-    st.markdown("##### 🧪 验证策略选择")
-    split_mode = st.radio(
-        "你想怎么验证模型？",
-        (
-            "1. 混合切分 (推荐)", 
-            "2. 留文件验证 (进阶)",
-            "3. 留日期/对象验证 (高难)"
-        ),
-        index=0
-    )
-    
-    strategy_map = {
-        "1. 混合切分 (推荐)": "混合切分 (看到所有天/人)",
-        "2. 留文件验证 (进阶)": "留文件验证 (同天/同人)",
-        "3. 留日期/对象验证 (高难)": "留日期/对象验证 (泛化能力)"
-    }
-    selected_strategy = strategy_map[split_mode]
+        st.markdown("##### 🧪 验证策略选择")
+        split_mode = st.radio(
+            "你想怎么验证模型？",
+            ("1. 混合切分 (推荐)", "2. 留文件验证 (进阶)", "3. 留日期/对象验证 (高难)"),
+            index=0
+        )
+        
+        strategy_map = {
+            "1. 混合切分 (推荐)": "混合切分 (看到所有天/人)",
+            "2. 留文件验证 (进阶)": "留文件验证 (同天/同人)",
+            "3. 留日期/对象验证 (高难)": "留日期/对象验证 (泛化能力)"
+        }
+        selected_strategy = strategy_map[split_mode]
 
-    # === 新增：根据策略显示“指定验证集”的下拉框 ===
-    manual_val_target = None
-    
-    if "留文件" in selected_strategy:
-        # 从 target_files 中提取所有文件名
-        if target_files:
+        # 根据策略显示手动验证集选择
+        manual_val_target = None
+        if "留文件" in selected_strategy and target_files:
             file_options = sorted(list(set([os.path.basename(f) for f in target_files])))
-            manual_val_target = st.selectbox(
-                "🎯 指定哪一个文件做测试？", 
-                file_options,
-                help="选中的文件将完全不参与训练，只用来做最后的考试。"
-            )
-            
-    elif "留日期" in selected_strategy:
-        # 从 target_files 中提取所有日期文件夹名
-        if target_files:
+            manual_val_target = st.selectbox("🎯 指定哪一个文件做测试？", file_options)
+        elif "留日期" in selected_strategy and target_files:
             group_options = sorted(list(set([os.path.basename(os.path.dirname(f)) for f in target_files])))
-            manual_val_target = st.selectbox(
-                "🎯 指定哪一天/对象做测试？", 
-                group_options,
-                help="选中的日期/对象的所有数据都将作为测试集，用于验证模型的跨天泛化能力。"
-            )
-
-
+            manual_val_target = st.selectbox("🎯 指定哪一天/对象做测试？", group_options)
+            
+        test_size = st.slider("测试集比例", 0.01, 0.5, 0.2)
+    
     st.markdown("---") 
+    # 共有参数
     epochs = st.number_input("Epochs", 10, 200, 50)
-    batch_size = st.selectbox("Batch Size", [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048], index=2)
-    test_size = st.slider("测试集比例", 0.01, 0.5, 0.2)
+    batch_size = st.selectbox("Batch Size", [32, 64, 128, 256, 512, 1024, 2048], index=2)
     
     run_btn = st.button("🚀 开始处理并训练", type="primary")
 # ================= 主逻辑区域 =================
@@ -429,7 +418,7 @@ if run_btn and target_files:
     # --- 2. 训练阶段 ---
     st.subheader("2. 模型训练")
     
-    # 【新增位置】：根据模式选择切分策略
+    # 根据模式选择切分策略
     if train_mode == "基于基模型微调 (Few-shot)":
         # 使用刚才定义的 Few-shot 切分函数
         train_idx, test_idx = get_few_shot_split(X, y, num_finetune_samples)
