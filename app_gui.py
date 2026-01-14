@@ -149,48 +149,105 @@ if selected_file:
     with st.spinner('正在处理信号...'):
         raw_data, _ = load_data(selected_file)
         
-        # 运行算法
+        # 运行算法 (获取基础 VAD 掩码)
         filtered_data, energy, threshold, mask = process_signal(
             raw_data, fs, band_range[0], band_range[1], 
             smooth_ms, merge_ms, thresh_ratio
         )
         
+        # --- [NEW] 第一步：提取初始片段 ---
         labeled_mask, num_raw_segments = ndimage.label(mask)
         
-        if use_rhythm_filter and num_raw_segments > 1:
-            # 提取中心点
-            centers = []
-            for i in range(1, num_raw_segments + 1):
-                idx = np.where(labeled_mask == i)[0]
-                centers.append((idx[0] + idx[-1]) / 2)
-            
-            # 计算基准节奏
-            diffs = np.diff(centers)
-            median_interval = np.median(diffs)
-            
-            # 重新生成过滤后的 mask
-            new_mask = np.zeros_like(mask)
-            valid_ids = [1] # 默认保留第一个
-            last_valid_center = centers[0]
-            
-            for i in range(1, num_raw_segments):
-                if (centers[i] - last_valid_center) > median_interval * interval_ratio:
-                    valid_ids.append(i + 1)
-                    last_valid_center = centers[i]
-            
-            # 只保留 valid_ids 中的区域
-            for vid in valid_ids:
-                new_mask[labeled_mask == vid] = True
-            
-            mask = new_mask
-            labeled_mask, num_segments = ndimage.label(mask) # 更新最终显示的片段数
-        else:
-            num_segments = num_raw_segments
+        # 使用 find_objects 一次性获取所有片段的切片 (Slice)
+        # slices[i] 对应 label i+1 的位置
+        slices = ndimage.find_objects(labeled_mask)
         
+        raw_segments = []
+        for i, sl in enumerate(slices):
+            if sl is None: continue
+            
+            # sl 是一个 tuple，对于 1D 数组，sl[0] 就是我们要的切片
+            # start = sl[0].start, end = sl[0].stop
+            start = sl[0].start
+            end = sl[0].stop
+            length = end - start
+            
+            # 简单的长度过滤 (防止极短的噪点)
+            if length > 10: 
+                raw_segments.append({
+                    'id': i + 1,
+                    'start': start,
+                    'end': end,
+                    'center': (start + end) / 2,
+                    # 'indices': ... # [优化] 不再存储巨大的索引数组，省内存
+                })
+        
+        # --- [优化版] 第二步：高能异常过滤 (去除翻腕) ---
+        valid_segments_step1 = []
+        if len(raw_segments) > 0:
+            segment_energies = []
+            for seg in raw_segments:
+                # 利用切片直接访问，无需 fancy indexing
+                seg_data = filtered_data[seg['start']:seg['end']]
+                
+                # 计算 RMS
+                if len(seg_data) > 0:
+                    rms = np.mean(np.sqrt(np.mean(seg_data**2, axis=0)))
+                else:
+                    rms = 0
+                segment_energies.append(rms)
+            
+            # 计算基准
+            median_energy = np.median(segment_energies) if segment_energies else 0
+            energy_limit = median_energy * 5.0
+            
+            rejected_segments = []
+            
+            for i, seg in enumerate(raw_segments):
+                if len(raw_segments) == 1 or segment_energies[i] < energy_limit:
+                    valid_segments_step1.append(seg)
+                else:
+                    rejected_segments.append(seg)
+        else:
+            valid_segments_step1 = raw_segments
+
+        # --- [优化版] 第三步：节奏过滤 ---
+        final_segments = []
+        if use_rhythm_filter and len(valid_segments_step1) > 1:
+            centers = [s['center'] for s in valid_segments_step1]
+            diffs = np.diff(centers)
+            if len(diffs) > 0:
+                median_interval = np.median(diffs)
+                
+                final_segments.append(valid_segments_step1[0])
+                last_valid_center = valid_segments_step1[0]['center']
+                
+                for i in range(1, len(valid_segments_step1)):
+                    curr_seg = valid_segments_step1[i]
+                    if (curr_seg['center'] - last_valid_center) > median_interval * interval_ratio:
+                        final_segments.append(curr_seg)
+                        last_valid_center = curr_seg['center']
+            else:
+                 final_segments = valid_segments_step1
+        else:
+            final_segments = valid_segments_step1
+            
+        # --- [优化版] 第四步：重建最终 Mask ---
+        final_mask = np.zeros_like(mask)
+        for seg in final_segments:
+            # [优化] 使用切片赋值，速度极快
+            final_mask[seg['start']:seg['end']] = True
+            
+        mask = final_mask
+        labeled_mask, num_segments = ndimage.label(mask)
+
     # ================= 绘图区域 =================
     
     # 图表 1: 信号全览
-    st.subheader(f"📊 信号概览 (检测到 {num_segments} 个动作)")
+    st.subheader(f"📊 信号概览 (检测到 {num_segments} 个有效动作)")
+    
+    if len(raw_segments) > len(final_segments):
+        st.caption(f"ℹ️ 已自动剔除 {len(raw_segments) - len(final_segments)} 个异常/干扰片段 (翻腕或非节奏动作)")
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
     

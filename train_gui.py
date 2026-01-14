@@ -12,7 +12,8 @@ import pandas as pd
 import data_loader
 import train_utils
 import ui_helper
-from model import build_simple_cnn, build_advanced_crnn
+# 在顶部 import 区域加入
+from model import build_simple_cnn, build_advanced_crnn, build_resnet_model, build_tcn_model, build_dual_stream_model
 
 # ================= 0. 全局设置 =================
 gpus = tf.config.list_physical_devices('GPU')
@@ -108,18 +109,31 @@ with st.sidebar:
         }
         
     st.markdown("---")
-    model_type = st.selectbox("选择模型核心", ["Lite: Simple CNN", "Pro: Multi-Scale CRNN"])
-
-    # === 新增：投票 Loss 配置区 ===
-    use_voting_loss = st.checkbox("🗳️ 开启投票机制辅助训练 (Vote Loss)", value=False, 
-                                  help="开启后，训练将不仅关注单切片准确率，还会优化整个动作片段的平均预测结果。")
+    st.header("模型与高级策略")
     
+    # 模型选择列表扩展
+    model_options = {
+        "Lite: Simple CNN": build_simple_cnn,
+        "Pro: Multi-Scale CRNN (Recommended)": build_advanced_crnn,
+        "New: ResNet-1D (Deep Residual)": build_resnet_model,
+        "New: TCN (Temporal ConvNet)": build_tcn_model,
+        "New: Dual-Stream (Time + Freq Fusion)": build_dual_stream_model
+    }
+    model_choice = st.selectbox("选择模型架构", list(model_options.keys()), index=1)
+    
+    # 高级技巧开关
+    use_mixup = st.checkbox("🧪 启用 Mixup 数据混合", value=False, help="混合两个样本及标签，提升泛化能力")
+    label_smoothing = st.slider("Label Smoothing (标签平滑)", 0.0, 0.5, 0.0, 0.01, help="防止模型对标签过度自信，0.1通常是个好值")
+    
+    # 投票 Loss (保持不变)
+    use_voting_loss = st.checkbox("🗳️ 开启投票机制辅助训练 (Vote Loss)", value=False)
     voting_weight = 0.0
-    samples_per_group = 5
+    samples_per_group = 5 # 给一个默认值，防止报错
+    
     if use_voting_loss:
         c1, c2 = st.columns(2)
-        voting_weight = c1.slider("投票 Loss 权重", 0.1, 0.9, 0.5, help="权重越高，模型越重视整组的一致性")
-        samples_per_group = c2.slider("每组采样切片数", 2, 20, 5, help="每次从一个动作中抽取多少个切片来计算平均值")
+        voting_weight = c1.slider("投票 Loss 权重", 0.1, 0.9, 0.5)
+        samples_per_group = c2.slider("每组采样切片数", 2, 20, 5)
 
     st.markdown("---")
     split_mode = st.radio("验证策略", ("1. 混合切分", "2. 留文件验证", "3. 留日期/对象验证"))
@@ -219,33 +233,34 @@ if run_btn and target_files:
             st.stop()
     else:
         input_shape = (X.shape[1], X.shape[2])
-        if "Lite" in model_type:
-            model = build_simple_cnn(input_shape, num_classes)
-        else:
-            model = build_advanced_crnn(input_shape, num_classes)
+        selected_builder = model_options[model_choice]
+        model = selected_builder(input_shape, num_classes)
+        
         model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
     # --- C. 开始训练 (分支逻辑) ---
     st.caption("训练监控")
     train_progress = st.progress(0)
     train_status = st.empty()
-
-    if use_voting_loss:
-        st.info(f"🔵 投票训练模式已激活 (Weight={voting_weight}, Samples/Group={samples_per_group})")
+    if use_voting_loss or use_mixup or label_smoothing > 0:
+        # 只要开启了任意高级特性，都建议走自定义训练循环 (train_utils.py)
+        # 因为 Keras 原生 fit() 处理 Mixup 比较麻烦
         
-        # 调用我们在 train_utils 中新写的自定义训练循环
+        st.info(f"🔵 启动高级训练循环 (Voting={use_voting_loss}, Mixup={use_mixup}, Smoothing={label_smoothing})")
+        
         history_dict = train_utils.train_with_voting_mechanism(
             model, X_train, y_train_mapped, groups_train,
             X_test, y_test_mapped,
             epochs=epochs,
             batch_size=batch_size,
             samples_per_group=samples_per_group,
-            vote_weight=voting_weight,
+            vote_weight=voting_weight if use_voting_loss else 0.0, # 如果没开投票，权重置0
             st_progress_bar=train_progress,
-            st_status_text=train_status
+            st_status_text=train_status,
+            use_mixup=use_mixup,
+            label_smoothing=label_smoothing
         )
         
-        # 伪装成 Keras history 对象以便后面画图代码复用
         class HistoryShim:
             def __init__(self, h_dict): self.history = h_dict
         history = HistoryShim(history_dict)
@@ -299,7 +314,7 @@ if run_btn and target_files:
     cm = confusion_matrix(y_test_mapped, y_pred)
     class_names = [str(k) for k in label_map.keys()] # 获取类别名称
     
-    fig_cm, ax_cm = plt.subplots(figsize=(8, 6))
+    fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
     try:
         # 尝试使用 Seaborn 绘制漂亮的热力图
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
@@ -316,7 +331,9 @@ if run_btn and target_files:
     
     ax_cm.set_xlabel('Predicted Label')
     ax_cm.set_ylabel('True Label')
-    st.pyplot(fig_cm)
+    col_small, _ = st.columns([1, 1]) 
+    with col_small:
+        st.pyplot(fig_cm)
 
     # 3. 详细分类指标 (Classification Report)
     st.write("#### (2) 详细分类指标")

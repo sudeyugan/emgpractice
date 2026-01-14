@@ -174,6 +174,34 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
                         'center': (indices[0] + indices[-1]) / 2
                     })
 
+            if len(candidate_segments) > 0:
+                # 1. 计算所有片段的 RMS 能量
+                segment_energies = []
+                for seg in candidate_segments:
+                    # 使用 data_clean 计算，它已经滤除了低频漂移和高频噪点
+                    seg_data = data_clean[seg['start']:seg['end']]
+                    # 计算 RMS (Root Mean Square) 并对所有通道求平均
+                    rms = np.mean(np.sqrt(np.mean(seg_data**2, axis=0)))
+                    segment_energies.append(rms)
+                
+                # 2. 计算基准 (使用中位数，防止被异常值拉偏)
+                median_energy = np.median(segment_energies)
+                
+                # 3. 执行过滤
+                filtered_segments = []
+                # 设定倍率阈值 (你提到的是 5 倍)
+                energy_threshold_ratio = 5.0 
+                
+                for i, seg in enumerate(candidate_segments):
+                    # 如果该片段能量小于 5倍基准，或者是该文件唯一的片段(无法比较)，则保留
+                    if segment_energies[i] < median_energy * energy_threshold_ratio:
+                        filtered_segments.append(seg)
+                    else:
+                        pass
+                        # print(f"  [Filter] 剔除高能异常(翻腕?): RMS={segment_energies[i]:.2f} (基准: {median_energy:.2f})")
+                
+                candidate_segments = filtered_segments
+
             # 节奏过滤
             final_segments = []
             if use_rhythm_filter and len(candidate_segments) > 1:
