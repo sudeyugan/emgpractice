@@ -4,15 +4,17 @@ import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+import pandas as pd
 
 # --- 模块导入 ---
 import data_loader
-import train_utils  # 新导入
-import ui_helper    # 新导入
+import train_utils
+import ui_helper
 from model import build_simple_cnn, build_advanced_crnn
 
 # ================= 0. 全局设置 =================
-# 获取 GPU 设置 (这段代码最好放在最前面)
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
@@ -44,10 +46,8 @@ with st.sidebar:
         st.error(f"未找到 {DATA_ROOT} 文件夹")
         st.stop()
         
-    # 调用 ui_helper 扫描文件
     structure, file_map = ui_helper.scan_data_folder(DATA_ROOT)
     
-    # --- 级联选择器 (调用 ui_helper) ---
     all_subjects = sorted(structure.keys())
     selected_subjects = ui_helper.render_multiselect_with_all(
         "选择测试者 (Subjects)", all_subjects, 'selected_subjects_key', default_first=True
@@ -70,7 +70,6 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # 统计选中文件
     target_files = []
     for s in selected_subjects:
         for d in selected_dates:
@@ -82,29 +81,21 @@ with st.sidebar:
 
     st.header("2. 增强与训练配置")
     
-    with st.expander("数据增强与采样", expanded=True):
+    with st.expander("数据增强与采样", expanded=False):
         train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 200, 100)
-        
-        st.markdown("---")
         st.caption("负样本策略")
         enable_rest = st.checkbox("加入静息类 (Rest, Label 0)", value=True)
-        
-        st.markdown("---")
-
         st.caption("增强策略")
         c1, c2 = st.columns(2)
         enable_scaling = c1.checkbox("幅度缩放", value=True)
         enable_noise = c2.checkbox("高斯噪声", value=True)
-        enable_warp = c1.checkbox("时间扭曲 (Warp)", value=False, help="模拟动作快慢变化")
-        enable_shift = c2.checkbox("时间平移 (Shift)", value=False, help="模拟触发时机偏移")
-        enable_mask = st.checkbox("通道遮挡 (Channel Mask)", value=False, help="模拟某个传感器接触不良，提升鲁棒性")
+        enable_warp = c1.checkbox("时间扭曲", value=False)
+        enable_shift = c2.checkbox("时间平移", value=False)
+        enable_mask = st.checkbox("通道遮挡", value=False)
         
-        # === 新增倍增系数 ===
         aug_multiplier = 1
         if train_mode == "基于基模型微调 (Few-shot)":
-            st.markdown("---")
-            aug_multiplier = st.slider("样本倍增系数 (Multiplier)", 1, 50, 20, 
-                                     help="将每个样本变成 N 个，20个样本 -> 400个训练数据")
+            aug_multiplier = st.slider("样本倍增系数", 1, 50, 20)
         
         augment_config = {
             'enable_rest': enable_rest,
@@ -119,8 +110,19 @@ with st.sidebar:
     st.markdown("---")
     model_type = st.selectbox("选择模型核心", ["Lite: Simple CNN", "Pro: Multi-Scale CRNN"])
 
-    split_mode = st.radio("验证策略", ("1. 混合切分", "2. 留文件验证", "3. 留日期/对象验证"))
+    # === 新增：投票 Loss 配置区 ===
+    use_voting_loss = st.checkbox("🗳️ 开启投票机制辅助训练 (Vote Loss)", value=False, 
+                                  help="开启后，训练将不仅关注单切片准确率，还会优化整个动作片段的平均预测结果。")
     
+    voting_weight = 0.0
+    samples_per_group = 5
+    if use_voting_loss:
+        c1, c2 = st.columns(2)
+        voting_weight = c1.slider("投票 Loss 权重", 0.1, 0.9, 0.5, help="权重越高，模型越重视整组的一致性")
+        samples_per_group = c2.slider("每组采样切片数", 2, 20, 5, help="每次从一个动作中抽取多少个切片来计算平均值")
+
+    st.markdown("---")
+    split_mode = st.radio("验证策略", ("1. 混合切分", "2. 留文件验证", "3. 留日期/对象验证"))
     strategy_map = {
         "1. 混合切分": "混合切分 (看到所有天/人)",
         "2. 留文件验证": "留文件验证 (同天/同人)",
@@ -138,7 +140,7 @@ with st.sidebar:
 
     st.markdown("---") 
     epochs = st.number_input("Epochs", 10, 200, 50)
-    batch_size = st.selectbox("Batch Size", [16, 32, 64, 128], index=1)
+    batch_size = st.selectbox("Batch Size (Groups if Voting)", [8, 16, 32, 64, 128, 256, 512], index=1)
     test_size = st.slider("测试集比例", 0.01, 0.5, 0.2)
     
     run_btn = st.button("🚀 开始处理并训练", type="primary")
@@ -171,7 +173,6 @@ if run_btn and target_files:
     # --- B. 模型训练准备 ---
     st.subheader("2. 模型训练")
     
-    # 划分数据集 (调用 train_utils)
     if train_mode == "基于基模型微调 (Few-shot)":
         train_idx, test_idx = train_utils.get_few_shot_split(X, y, num_finetune_samples)
     else:
@@ -181,8 +182,8 @@ if run_btn and target_files:
 
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
+    groups_train = groups[train_idx] # 获取训练集的组信息，用于投票训练
     
-    # 标签映射
     unique_labels = np.unique(y)
     num_classes = len(unique_labels) 
     label_map = {original: new for new, original in enumerate(unique_labels)}
@@ -192,56 +193,27 @@ if run_btn and target_files:
     # 构建模型
     if train_mode == "基于基模型微调 (Few-shot)":
         if base_model_path:
-            # 1. 保存并加载上传的基模型
             with open("temp_model.h5", "wb") as f: f.write(base_model_path.getbuffer())
             base_model = tf.keras.models.load_model("temp_model.h5")
-            
-            # 2. 冻结基模型的所有层
-            # 意味着在反向传播时，这些层的权重绝对不会更新，保护它们学到的通用特征
             base_model.trainable = False 
             
-            # 3. 剥离旧的分类头，保留特征提取部分
-            
             feature_output = None
-            
-            # 尝试自动寻找 GlobalAveragePooling 层
             for layer in reversed(base_model.layers):
                 if "global_average_pooling" in layer.name or "flatten" in layer.name:
                     feature_output = layer.output
                     break
+            if feature_output is None: feature_output = base_model.layers[-3].output
             
-            # 如果找不到（比如是老版本模型），则强制取倒数第三层的输出
-            if feature_output is None:
-                feature_output = base_model.layers[-3].output
-            
-            # 4. 构建更加稳健的新分类头 (Robust Head)
             x = feature_output
-            
-            # [关键点 A] 高 Dropout: 随机丢弃 50% 的神经元，强迫模型不依赖某个特定特征
-            x = tf.keras.layers.Dropout(0.5)(x) 
-            
-            # [关键点 B] L2 正则化: 惩罚过大的权重，防止模型“死记硬背”这 20 个样本
+            x = tf.keras.layers.Dropout(0.5, name="ft_dropout_1")(x) 
             x = tf.keras.layers.Dense(64, activation='relu', 
-                                      kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)
-            
-            # 第二层 Dropout，进一步增加难度
-            x = tf.keras.layers.Dropout(0.3)(x)
-            
-            # 最终分类层
+                                      kernel_regularizer=tf.keras.regularizers.l2(0.01),
+                                      name="ft_dense_1")(x)
+            x = tf.keras.layers.Dropout(0.3, name="ft_dropout_2")(x)
             outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
             
-            # 组合成新模型
-            # 注意：inputs 必须来自 base_model.input
             model = tf.keras.models.Model(inputs=base_model.input, outputs=outputs)
-            
-            # [关键点 C] 极小的学习率: 微调必须小心翼翼
-            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), 
-                          loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-            
-            st.success(f"✅ 微调模型构建成功！\n策略: 冻结基模型 + L2正则化 + 双重Dropout。")
-            
-            model.summary() 
-            
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
         else:
             st.error("请上传基模型 (.h5 文件)")
             st.stop()
@@ -253,62 +225,165 @@ if run_btn and target_files:
             model = build_advanced_crnn(input_shape, num_classes)
         model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
-    # --- C. 开始训练 ---
+    # --- C. 开始训练 (分支逻辑) ---
     st.caption("训练监控")
     train_progress = st.progress(0)
     train_status = st.empty()
-    
-    # 实例化回调 (调用 train_utils)
-    st_callback = train_utils.StreamlitKerasCallback(epochs, train_progress, train_status)
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)
 
-    history = model.fit(
-        X_train, y_train_mapped,
-        epochs=epochs,
-        batch_size=batch_size,
-        validation_data=(X_test, y_test_mapped),
-        callbacks=[EarlyStopping(patience=10, restore_best_weights=True), reduce_lr, st_callback],
-        verbose=0
-    )
+    if use_voting_loss:
+        st.info(f"🔵 投票训练模式已激活 (Weight={voting_weight}, Samples/Group={samples_per_group})")
+        
+        # 调用我们在 train_utils 中新写的自定义训练循环
+        history_dict = train_utils.train_with_voting_mechanism(
+            model, X_train, y_train_mapped, groups_train,
+            X_test, y_test_mapped,
+            epochs=epochs,
+            batch_size=batch_size,
+            samples_per_group=samples_per_group,
+            vote_weight=voting_weight,
+            st_progress_bar=train_progress,
+            st_status_text=train_status
+        )
+        
+        # 伪装成 Keras history 对象以便后面画图代码复用
+        class HistoryShim:
+            def __init__(self, h_dict): self.history = h_dict
+        history = HistoryShim(history_dict)
+        
+    else:
+        # 标准训练模式
+        st_callback = train_utils.StreamlitKerasCallback(epochs, train_progress, train_status)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)
+
+        history = model.fit(
+            X_train, y_train_mapped,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(X_test, y_test_mapped),
+            callbacks=[EarlyStopping(patience=10, restore_best_weights=True), reduce_lr, st_callback],
+            verbose=0
+        )
     
     st.success("训练完成！")
     
-    # --- D. 结果可视化 ---
+# --- D. 结果可视化 (基础曲线) ---
     col1, col2 = st.columns(2)
     with col1:
         fig, ax = plt.subplots()
         ax.plot(history.history['accuracy'], label='Train')
         ax.plot(history.history['val_accuracy'], label='Val')
-        ax.set_title("Accuracy")
+        ax.set_title("Window Level Accuracy")
         ax.legend()
         st.pyplot(fig)
     with col2:
         fig, ax = plt.subplots()
         ax.plot(history.history['loss'], label='Train')
         ax.plot(history.history['val_loss'], label='Val')
-        ax.set_title("Loss")
+        ax.set_title("Loss Curve")
         ax.legend()
         st.pyplot(fig)
     
-    # 投票模拟逻辑
-    y_pred = np.argmax(model.predict(X_test), axis=1)
+    # --- E. 深度评估报告  ---
+    st.markdown("---")
+    st.subheader("3. 深度评估报告")
+
+    # 1. 准备预测数据
+    # 获取切片级预测
+    y_pred_probs = model.predict(X_test)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    # 2. 混淆矩阵 (Confusion Matrix)
+    st.write("#### (1) 混淆矩阵 (Confusion Matrix)")
+    st.caption("横轴为预测类别，纵轴为真实类别。对角线颜色越深越好。")
+    
+    cm = confusion_matrix(y_test_mapped, y_pred)
+    class_names = [str(k) for k in label_map.keys()] # 获取类别名称
+    
+    fig_cm, ax_cm = plt.subplots(figsize=(8, 6))
+    try:
+        # 尝试使用 Seaborn 绘制漂亮的热力图
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=class_names, 
+                    yticklabels=class_names, ax=ax_cm)
+    except:
+        # 如果没有安装 seaborn，使用 matplotlib 兜底
+        cax = ax_cm.matshow(cm, cmap='Blues')
+        fig_cm.colorbar(cax)
+        for (i, j), z in np.ndenumerate(cm):
+            ax_cm.text(j, i, '{:0.1f}'.format(z), ha='center', va='center')
+        ax_cm.set_xticklabels([''] + class_names)
+        ax_cm.set_yticklabels([''] + class_names)
+    
+    ax_cm.set_xlabel('Predicted Label')
+    ax_cm.set_ylabel('True Label')
+    st.pyplot(fig_cm)
+
+    # 3. 详细分类指标 (Classification Report)
+    st.write("#### (2) 详细分类指标")
+    report_dict = classification_report(y_test_mapped, y_pred, 
+                                        target_names=class_names, 
+                                        output_dict=True)
+    # 转为 DataFrame 并高亮显示
+    report_df = pd.DataFrame(report_dict).transpose()
+    st.dataframe(report_df.style.background_gradient(cmap='Greens', subset=['f1-score']))
+
+    # 4. 基于投票的“分动作”准确率 (Per-Class Segment Accuracy)
+    st.write("#### (3) 🗳️ 动作片段级投票详情 (Segment Level Analysis)")
+    
+    # --- 投票逻辑 ---
     test_groups = groups[test_idx]
-    
     voting_results = {}
-    for i, g in enumerate(test_groups):
-        if g not in voting_results: voting_results[g] = {'true': y_test_mapped[i], 'preds': []}
-        voting_results[g]['preds'].append(y_pred[i])
-        
-    correct = sum(1 for res in voting_results.values() 
-                  if np.argmax(np.bincount(res['preds'], minlength=num_classes)) == res['true'])
-    segment_acc = correct / len(voting_results) if voting_results else 0
     
-    _, win_acc = model.evaluate(X_test, y_test_mapped, verbose=0)
-    st.metric("Segment Level Accuracy (Voting)", f"{segment_acc*100:.2f}%", delta=f"Window Acc: {win_acc*100:.2f}%")
+    # 收集每个片段的票数
+    for i, g in enumerate(test_groups):
+        if g not in voting_results: 
+            voting_results[g] = {'true': y_test_mapped[i], 'preds': []}
+        voting_results[g]['preds'].append(y_pred[i])
+    
+    # 统计结果
+    segment_stats = {} # 记录每个类别的 {total: 0, correct: 0}
+    for cls in label_map.keys():
+        segment_stats[cls] = {'total': 0, 'correct': 0}
 
-    st.session_state['trained_model'] = model
+    total_segments = 0
+    total_correct = 0
 
-# --- E. 模型保存 ---
+    for res in voting_results.values():
+        true_label = res['true']
+        # 找到票数最多的类别
+        vote_pred = np.argmax(np.bincount(res['preds'], minlength=num_classes))
+        
+        # 转换回原始 Label 名称以便统计
+        true_label_name = list(label_map.keys())[list(label_map.values()).index(true_label)]
+        
+        segment_stats[true_label_name]['total'] += 1
+        total_segments += 1
+        if vote_pred == true_label:
+            segment_stats[true_label_name]['correct'] += 1
+            total_correct += 1
+            
+    # 计算总投票准确率
+    segment_acc = total_correct / total_segments if total_segments > 0 else 0
+    
+    # 显示大字指标
+    st.metric(" 最终段级准确率 (Segment Accuracy)", f"{segment_acc*100:.2f}%", 
+              help="这是实际使用时的预期准确率（经过投票修正后）")
+    
+    # 显示分动作详情表
+    st.caption("👇 每个动作独立表现：")
+    per_class_data = []
+    for cls, stat in segment_stats.items():
+        acc = (stat['correct'] / stat['total']) * 100 if stat['total'] > 0 else 0
+        per_class_data.append({
+            "动作ID (Label)": cls,
+            "片段总数": stat['total'],
+            "正确识别数": stat['correct'],
+            "准确率 (%)": f"{acc:.1f}%"
+        })
+    
+    st.table(pd.DataFrame(per_class_data))
+
+# --- F. 模型保存 ---
 if st.session_state['trained_model']:
     st.markdown("---")
     c1, c2 = st.columns(2)
