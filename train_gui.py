@@ -82,11 +82,39 @@ with st.sidebar:
 
     st.header("2. 增强与训练配置")
     
-    with st.expander("🛠️ 数据增强", expanded=True):
-        train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 200, 100, 10, help="建议 50ms 左右。")
-        enable_scaling = st.checkbox("启用随机幅度缩放", value=False)
-        enable_noise = st.checkbox("启用高斯噪声", value=False)
-        augment_config = {'enable_scaling': enable_scaling, 'enable_noise': enable_noise}
+    with st.expander("数据增强与采样", expanded=True):
+        train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 200, 100)
+        
+        st.markdown("---")
+        st.caption("负样本策略")
+        enable_rest = st.checkbox("加入静息类 (Rest, Label 0)", value=True)
+        
+        st.markdown("---")
+
+        st.caption("增强策略")
+        c1, c2 = st.columns(2)
+        enable_scaling = c1.checkbox("幅度缩放", value=True)
+        enable_noise = c2.checkbox("高斯噪声", value=True)
+        enable_warp = c1.checkbox("时间扭曲 (Warp)", value=False, help="模拟动作快慢变化")
+        enable_shift = c2.checkbox("时间平移 (Shift)", value=False, help="模拟触发时机偏移")
+        enable_mask = st.checkbox("通道遮挡 (Channel Mask)", value=False, help="模拟某个传感器接触不良，提升鲁棒性")
+        
+        # === 新增倍增系数 ===
+        aug_multiplier = 1
+        if train_mode == "基于基模型微调 (Few-shot)":
+            st.markdown("---")
+            aug_multiplier = st.slider("样本倍增系数 (Multiplier)", 1, 50, 20, 
+                                     help="将每个样本变成 N 个，20个样本 -> 400个训练数据")
+        
+        augment_config = {
+            'enable_rest': enable_rest,
+            'multiplier': aug_multiplier,
+            'enable_scaling': enable_scaling, 
+            'enable_noise': enable_noise,
+            'enable_warp': enable_warp,
+            'enable_shift': enable_shift,
+            'enable_mask': enable_mask
+        }
         
     st.markdown("---")
     model_type = st.selectbox("选择模型核心", ["Lite: Simple CNN", "Pro: Multi-Scale CRNN"])
@@ -164,14 +192,58 @@ if run_btn and target_files:
     # 构建模型
     if train_mode == "基于基模型微调 (Few-shot)":
         if base_model_path:
+            # 1. 保存并加载上传的基模型
             with open("temp_model.h5", "wb") as f: f.write(base_model_path.getbuffer())
-            model = tf.keras.models.load_model("temp_model.h5")
-            for layer in model.layers[:-2]: layer.trainable = False
+            base_model = tf.keras.models.load_model("temp_model.h5")
+            
+            # 2. 冻结基模型的所有层
+            # 意味着在反向传播时，这些层的权重绝对不会更新，保护它们学到的通用特征
+            base_model.trainable = False 
+            
+            # 3. 剥离旧的分类头，保留特征提取部分
+            
+            feature_output = None
+            
+            # 尝试自动寻找 GlobalAveragePooling 层
+            for layer in reversed(base_model.layers):
+                if "global_average_pooling" in layer.name or "flatten" in layer.name:
+                    feature_output = layer.output
+                    break
+            
+            # 如果找不到（比如是老版本模型），则强制取倒数第三层的输出
+            if feature_output is None:
+                feature_output = base_model.layers[-3].output
+            
+            # 4. 构建更加稳健的新分类头 (Robust Head)
+            x = feature_output
+            
+            # [关键点 A] 高 Dropout: 随机丢弃 50% 的神经元，强迫模型不依赖某个特定特征
+            x = tf.keras.layers.Dropout(0.5)(x) 
+            
+            # [关键点 B] L2 正则化: 惩罚过大的权重，防止模型“死记硬背”这 20 个样本
+            x = tf.keras.layers.Dense(64, activation='relu', 
+                                      kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)
+            
+            # 第二层 Dropout，进一步增加难度
+            x = tf.keras.layers.Dropout(0.3)(x)
+            
+            # 最终分类层
+            outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
+            
+            # 组合成新模型
+            # 注意：inputs 必须来自 base_model.input
+            model = tf.keras.models.Model(inputs=base_model.input, outputs=outputs)
+            
+            # [关键点 C] 极小的学习率: 微调必须小心翼翼
             model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), 
                           loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-            st.success("基模型加载成功 (冻结层).")
+            
+            st.success(f"✅ 微调模型构建成功！\n策略: 冻结基模型 + L2正则化 + 双重Dropout。")
+            
+            model.summary() 
+            
         else:
-            st.error("请上传基模型")
+            st.error("请上传基模型 (.h5 文件)")
             st.stop()
     else:
         input_shape = (X.shape[1], X.shape[2])
