@@ -135,7 +135,7 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
                 final_segments = candidate_segments
             
             # 6. 遍历最终片段进行切片
-            for seg in final_segments:
+            for idx, seg in enumerate(final_segments):
 
                 segment_data = data_clean[seg['start']:seg['end']]
 
@@ -152,7 +152,7 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
                     # === A. 保存原始窗口 ===
                     X_list.append(window)
                     y_list.append(label)
-                    groups_list.append(f) # 记录这个窗口来自哪个文件
+                    groups_list.append(f"{f}_seg{idx}")
                     
                     # === B. 数据增强 (生成额外的窗口) ===
                     # 只有在 augment_config 存在且非空时执行
@@ -162,7 +162,7 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
                             aug_window = scale_amplitude(window, scale_range=(0.8, 1.2))
                             X_list.append(aug_window)
                             y_list.append(label)
-                            groups_list.append(f)
+                            groups_list.append(f"{f}_seg{idx}")
                             
                         # 2. 高斯噪声 (可以在缩放的基础上加，也可以单独加，这里演示独立加)
                         if augment_config.get('enable_noise', False):
@@ -170,7 +170,7 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
                             aug_window = add_noise(window, noise_level=0.05) 
                             X_list.append(aug_window)
                             y_list.append(label)
-                            groups_list.append(f)
+                            groups_list.append(f"{f}_seg{idx}")
 
         except Exception as e:
             print(f"Error processing {f}: {e}")

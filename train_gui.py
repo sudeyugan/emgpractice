@@ -146,7 +146,7 @@ def smart_split(X, y, groups, strategy, test_size=0.2, manual_target=None):
         if manual_target:
             # groups 里存的是全路径，manual_target 是文件名 (basename)
             # 找到所有属于该文件的样本索引
-            is_test = np.array([os.path.basename(f) == manual_target for f in groups])
+            is_test = np.array([os.path.basename(g.split('_seg')[0]) == manual_target for g in groups])
             test_idx = indices[is_test]
             train_idx = indices[~is_test]
         else:
@@ -173,7 +173,7 @@ def smart_split(X, y, groups, strategy, test_size=0.2, manual_target=None):
         
     return np.array(train_idx), np.array(test_idx)
 
-def get_few_shot_split(X, y, groups, n_samples_per_class):
+def get_few_shot_split(X, y, n_samples_per_class):
     """
     为每个类别提取固定数量的样本用于微调，其余用于测试
     """
@@ -396,7 +396,7 @@ with st.sidebar:
 
     st.markdown("---") 
     epochs = st.number_input("Epochs", 10, 200, 50)
-    batch_size = st.selectbox("Batch Size", [32, 64, 128, 256, 512, 1024, 2048], index=2)
+    batch_size = st.selectbox("Batch Size", [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048], index=2)
     test_size = st.slider("测试集比例", 0.01, 0.5, 0.2)
     
     run_btn = st.button("🚀 开始处理并训练", type="primary")
