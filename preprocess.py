@@ -115,6 +115,9 @@ def process_data():
             # 提取 CH1-CH5
             cols = [c for c in df.columns if 'CH' in c]
             raw_data = df[cols].values
+
+            if raw_data.shape[1] >= 5:
+                raw_data[:, 4] = raw_data[:, 4] * 2.5
         except Exception as e:
             print(f"  Error reading file: {e}")
             continue

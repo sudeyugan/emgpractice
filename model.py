@@ -184,7 +184,7 @@ def build_dual_stream_model(input_shape, num_classes):
     # frame_length=64, frame_step=32 对应约 64ms 窗口
     stft = layers.Lambda(lambda x: tf.signal.stft(x, frame_length=64, frame_step=32))(merged_channel)
     stft = layers.Lambda(lambda x: tf.abs(x))(stft) # 取幅值 (B, T_frames, Freq_bins)
-    stft = layers.ExpandDims(-1)(stft) # 增加通道维变成图片 (B, H, W, 1)
+    stft = layers.Lambda(lambda x: tf.expand_dims(x, -1))(stft) # 增加通道维变成图片 (B, H, W, 1)
     
     # 3. 2D CNN 处理频谱图
     f = layers.Conv2D(32, (3,3), activation='relu', padding='same')(stft)

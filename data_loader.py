@@ -5,67 +5,91 @@ import scipy.ndimage as ndimage
 import os
 import re
 
-# ================= 默认参数 (已根据图片和 preprocess.py 对齐) =================
+# ================= 配置参数 (已同步 GUI 设置) =================
 FS = 1000                   # 采样率 1000Hz
 WINDOW_MS = 250             # 窗口 250ms
 WINDOW_SIZE = int(FS * (WINDOW_MS / 1000))
 
-# VAD (活动检测) 参数
-VAD_SMOOTH_MS = 200         # 能量平滑窗口 (ms)
-VAD_MERGE_GAP_MS = 300      # 合并间隙 (ms)
-MIN_SEGMENT_MS = 300        # 最小动作长度 (ms)
-THRESHOLD_RATIO = 0.15      # 阈值系数
+# --- VAD (活动检测) 参数 ---
+VAD_SMOOTH_MS = 100         # 平滑窗口 (GUI: 100ms)
+VAD_MERGE_GAP_MS = 200      # 合并间隙 (GUI: 200ms)
+THRESHOLD_RATIO = 0.15      # 阈值系数 (GUI: 0.15)
 
-# 节奏过滤参数
-INTERVAL_RATIO = 0.70       # 最小间距比例 (与图片 0.70 一致)
+# --- 过滤逻辑参数 ---
+ENABLE_NOTCH = True         # 启用工频陷波
+NOTCH_FREQ = 50             # 干扰频率 50Hz
+ENABLE_REFINE = True        # 启用时长门控 (1s/500ms 逻辑)
+ENABLE_RHYTHM = True        # 启用节奏过滤
+EXPECTED_INTERVAL_MS = 4000 # 节奏基准 4秒
+INTERVAL_RATIO = 0.90       # 最小间距比例 (GUI: 0.90)
 
 def parse_filename_info(filepath):
     """解析文件名，返回 (Subject, Date, Label, Timestamp)"""
     filename = os.path.basename(filepath)
-    # 假设路径结构 data/Subject/Date/filename
     parts = filepath.split(os.sep)
     subject = parts[-3] if len(parts) >= 3 else "Unknown"
     date = parts[-2] if len(parts) >= 3 else "Unknown"
     
-    # 提取 Label: DF1.1 -> 1
     label_match = re.search(r'DF(\d+)\.', filename)
     label = int(label_match.group(1)) if label_match else None
     
     return subject, date, label, filename
 
-def get_active_mask(data):
-    """VAD 基础掩码生成 (同步 app_gui 逻辑)"""
-    # 1. 带通滤波
-    b, a = signal.butter(4, [20, 450], btype='bandpass', fs=FS)
-    filtered = signal.filtfilt(b, a, data, axis=0)
+def refine_mask_logic(mask):
+    """
+    [移植自 app_gui.py] 业务逻辑优化掩码：
+    1. > 5s: 视为粘连，尝试断开。
+    2. 1s < len <= 5s: 丢弃。
+    3. 500ms < len <= 1s: 截取中间 500ms。
+    4. <= 500ms: 保留。
+    """
+    labeled, num = ndimage.label(mask)
+    new_mask = np.zeros_like(mask, dtype=bool)
+    samples_500ms = int(0.5 * FS)
     
-    # 2. 计算能量 (RMS)
-    energy = np.sqrt(np.mean(filtered**2, axis=1))
-    
-    # 3. 平滑能量
-    win_len = int((VAD_SMOOTH_MS/1000) * FS)
-    energy_smooth = np.convolve(energy, np.ones(win_len)/win_len, mode='same')
-    
-    # 4. 动态阈值计算
-    noise_floor = np.percentile(energy_smooth, 10)
-    peak_level = np.percentile(energy_smooth, 99)
-    threshold = noise_floor + THRESHOLD_RATIO * (peak_level - noise_floor)
-    
-    # 5. 生成掩码并缝合间隙
-    mask = energy_smooth > threshold
-    gap_samples = int((VAD_MERGE_GAP_MS/1000) * FS)
-    mask = ndimage.binary_closing(mask, structure=np.ones(gap_samples))
-    return mask
+    for i in range(1, num + 1):
+        loc = np.where(labeled == i)[0]
+        if len(loc) == 0: continue
+        
+        duration_ms = (len(loc) / FS) * 1000
+        
+        if duration_ms > 5000:
+            # 处理粘连：腐蚀操作尝试断开
+            seg_mask = np.zeros_like(mask)
+            seg_mask[loc] = True
+            structure = np.ones(int(0.2 * FS)) # 0.2s 的结构元素
+            opened_mask = ndimage.binary_opening(seg_mask, structure=structure)
+            sub_labeled, sub_num = ndimage.label(opened_mask)
+            for j in range(1, sub_num + 1):
+                sub_loc = np.where(sub_labeled == j)[0]
+                sub_dur = (len(sub_loc) / FS) * 1000
+                if sub_dur <= 1000: # 拆分后符合条件的
+                    if 500 < sub_dur <= 1000:
+                        center = int(np.mean(sub_loc))
+                        half = samples_500ms // 2
+                        s = max(0, center - half)
+                        e = min(len(mask), center + half)
+                        new_mask[s:e] = True
+                    else:
+                        new_mask[sub_loc] = True
+        elif 1000 < duration_ms <= 5000:
+            continue # 丢弃
+        elif 500 < duration_ms <= 1000:
+            # 截取中间 500ms
+            center = int(np.mean(loc))
+            half = samples_500ms // 2
+            start = max(0, center - half)
+            end = min(len(mask), center + half)
+            new_mask[start:end] = True
+        else:
+            new_mask[loc] = True # 保留短动作
+            
+    return new_mask
 
 def time_warp(data, sigma=0.2, knot=4):
-    """
-    时间扭曲：模拟动作忽快忽慢
-    """
+    """时间扭曲增强"""
     orig_steps = np.arange(data.shape[0])
-    
     random_warps = np.random.normal(loc=1.0, scale=sigma, size=(knot+2, data.shape[1]))
-    warp_steps = (np.linspace(0, data.shape[0]-1., num=knot+2))
-    
     ret = np.zeros_like(data)
     for i in range(data.shape[1]):
         time_warp = np.interp(orig_steps, np.linspace(0, data.shape[0]-1., num=knot+2), random_warps[:, i])
@@ -76,16 +100,12 @@ def time_warp(data, sigma=0.2, knot=4):
     return ret
 
 def time_shift(data, shift_limit=0.1):
-    """
-    时间平移：模拟动作触发时机的微小差异
-    """
+    """时间平移增强"""
     shift_amt = int(data.shape[0] * shift_limit * np.random.uniform(-1, 1))
     return np.roll(data, shift_amt, axis=0)
 
 def channel_mask(data, mask_prob=0.15):
-    """
-    通道遮挡：模拟某个电极接触不良 (强迫模型利用其他通道)
-    """
+    """通道遮挡增强"""
     temp = data.copy()
     if np.random.random() < mask_prob:
         c = np.random.randint(0, data.shape[1])
@@ -93,18 +113,17 @@ def channel_mask(data, mask_prob=0.15):
     return temp
 
 def add_noise(data, noise_level=0.01):
-    """高斯白噪声"""
     noise = np.random.normal(0, noise_level, data.shape)
     return data + noise
 
 def scale_amplitude(data, scale_range=(0.8, 1.2)):
-    """幅度缩放"""
     factor = np.random.uniform(scale_range[0], scale_range[1])
     return data * factor
 
-def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=True, stride_ms=100, augment_config=None):
+def process_selected_files(file_list, progress_callback=None, stride_ms=100, augment_config=None):
     """
-    更新：自动提取静息 (Rest) 数据作为 Label 0
+    核心处理流程：严格同步 app_gui.py 的信号处理链
+    Raw -> CH5 Gain -> Notch -> Bandpass -> Energy -> VAD -> Refine -> Rhythm -> Slice
     """
     if augment_config is None: augment_config = {}
     
@@ -117,6 +136,7 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
     enable_noise = augment_config.get('enable_noise', False)
     enable_scaling = augment_config.get('enable_scaling', False)
 
+    # 自动计算静息样本比例
     rest_ratio_per_file = 0
     if enable_rest:
         unique_labels = set()
@@ -125,13 +145,8 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
                 _, _, label, _ = parse_filename_info(f)
                 if label is not None: unique_labels.add(label)
             except: pass
-        
         num_act_classes = len(unique_labels) if len(unique_labels) > 0 else 1
-        # 目标：让 Rest 总量 ≈ 动作总量的 1.1 倍
         rest_ratio_per_file = 1.1 / num_act_classes
-        print(f"[Info] 静息模式开启。动作类别数: {num_act_classes}, 单文件静息系数: {rest_ratio_per_file:.3f}")
-    else:
-        print("[Info] 静息模式关闭。只训练动作样本。")
     
     X_list = []
     y_list = []
@@ -144,7 +159,7 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
     
     for idx, f in enumerate(file_list):
         if progress_callback:
-            progress_callback(idx / total, f"处理中: {os.path.basename(f)}")
+            progress_callback(idx / total, f"Processing: {os.path.basename(f)}")
             
         try:
             _, _, label, _ = parse_filename_info(f)
@@ -154,90 +169,125 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
             cols = [c for c in df.columns if 'CH' in c]
             raw_data = df[cols].values
             
-            # 1. 滤波
+            # --- 1. CH5 信号增益修正 ---
+            if raw_data.shape[1] >= 5:
+                raw_data[:, 4] = raw_data[:, 4] * 2.5
+                
+            # --- 2. 信号滤波链 (与 GUI 一致) ---
+            data_proc = raw_data.copy()
+            
+            # A. 工频陷波 (Notch) - GUI: 启用, 50Hz
+            if ENABLE_NOTCH:
+                b_notch, a_notch = signal.iirnotch(NOTCH_FREQ, 30, FS)
+                data_proc = signal.filtfilt(b_notch, a_notch, data_proc, axis=0)
+            
+            # B. 带通滤波 (Bandpass) - GUI: 20-450Hz
             b, a = signal.butter(4, [20, 450], btype='bandpass', fs=FS)
-            data_clean = signal.filtfilt(b, a, raw_data, axis=0)
+            data_clean = signal.filtfilt(b, a, data_proc, axis=0)
             
-            # 2. VAD 动作检测
-            mask = get_active_mask(raw_data) # 获取动作掩码
-
-            # PART A: 提取动作样本 (Label = 1, 2, 3...)
-            labeled_mask, num_raw_features = ndimage.label(mask)
+            # --- 3. VAD 掩码生成 ---
+            # 计算能量
+            energy = np.sqrt(np.mean(data_clean**2, axis=1))
             
+            # 平滑 - GUI: 100ms
+            win_len = int((VAD_SMOOTH_MS/1000) * FS)
+            energy_smooth = np.convolve(energy, np.ones(win_len)/win_len, mode='same')
+            
+            # 阈值 - GUI: 0.15
+            noise_floor = np.percentile(energy_smooth, 10)
+            peak_level = np.percentile(energy_smooth, 99)
+            threshold = noise_floor + THRESHOLD_RATIO * (peak_level - noise_floor)
+            
+            raw_mask = energy_smooth > threshold
+            
+            # 合并间隙 - GUI: 200ms
+            gap_samples = int((VAD_MERGE_GAP_MS/1000) * FS)
+            raw_mask = ndimage.binary_closing(raw_mask, structure=np.ones(gap_samples))
+            
+            # --- 4. 过滤逻辑优化 (Refine & Rhythm) ---
+            
+            # A. 时长门控 (Refine) - GUI: 启用
+            if ENABLE_REFINE:
+                final_mask = refine_mask_logic(raw_mask)
+            else:
+                final_mask = raw_mask
+                
+            # 提取候选片段
+            labeled_mask, num_features = ndimage.label(final_mask)
             candidate_segments = []
-            for i in range(1, num_raw_features + 1):
+            for i in range(1, num_features + 1):
                 indices = np.where(labeled_mask == i)[0]
-                if len(indices) >= int((MIN_SEGMENT_MS/1000) * FS):
+                # 再次校验长度 (refine_logic 已经做过，但为了安全)
+                if len(indices) > 0:
                     candidate_segments.append({
                         'start': indices[0],
                         'end': indices[-1],
                         'center': (indices[0] + indices[-1]) / 2
                     })
-
+            
             if len(candidate_segments) > 0:
-                # 1. 计算所有片段的 RMS 能量
                 segment_energies = []
                 for seg in candidate_segments:
-                    # 使用 data_clean 计算，它已经滤除了低频漂移和高频噪点
+                    # 使用 data_clean (多通道) 计算平均 RMS
                     seg_data = data_clean[seg['start']:seg['end']]
-                    # 计算 RMS (Root Mean Square) 并对所有通道求平均
+                    # 1. 算出每个通道的 RMS -> 2. 对所有通道取平均
                     rms = np.mean(np.sqrt(np.mean(seg_data**2, axis=0)))
                     segment_energies.append(rms)
                 
-                # 2. 计算基准 (使用中位数，防止被异常值拉偏)
+                # 计算基准 (中位数)
                 median_energy = np.median(segment_energies)
+                # 设定倍率阈值 (通常 5.0 倍于中位数的视为异常)
+                energy_threshold = median_energy * 5.0
                 
-                # 3. 执行过滤
-                filtered_segments = []
-                # 设定倍率阈值 (你提到的是 5 倍)
-                energy_threshold_ratio = 5.0 
-                
+                filtered_candidates = []
                 for i, seg in enumerate(candidate_segments):
-                    # 如果该片段能量小于 5倍基准，或者是该文件唯一的片段(无法比较)，则保留
-                    if segment_energies[i] < median_energy * energy_threshold_ratio:
-                        filtered_segments.append(seg)
-                    else:
-                        pass
-                        # print(f"  [Filter] 剔除高能异常(翻腕?): RMS={segment_energies[i]:.2f} (基准: {median_energy:.2f})")
+                    if segment_energies[i] < energy_threshold:
+                        filtered_candidates.append(seg)
+                    # else: print(f"剔除高能异常: {segment_energies[i]:.2f} > {energy_threshold:.2f}")
                 
-                candidate_segments = filtered_segments
+                candidate_segments = filtered_candidates
 
-            # 节奏过滤
+            # B. 节奏过滤 (Rhythm) - GUI: 启用 4s, 0.90
             final_segments = []
-            if use_rhythm_filter and len(candidate_segments) > 1:
-                centers = np.array([s['center'] for s in candidate_segments])
-                diffs = np.diff(centers)
-                median_interval = np.median(diffs)
+            if ENABLE_RHYTHM and len(candidate_segments) > 1:
+                # 使用固定 4秒 间隔
+                expected_interval = EXPECTED_INTERVAL_MS * (FS / 1000) # samples
+                min_gap = expected_interval * INTERVAL_RATIO
+                
                 final_segments.append(candidate_segments[0])
+                last_center = candidate_segments[0]['center']
+                
                 for i in range(1, len(candidate_segments)):
-                    last_center = final_segments[-1]['center']
                     curr_center = candidate_segments[i]['center']
-                    if (curr_center - last_center) > median_interval * INTERVAL_RATIO:
+                    # 只有当距离上一个有效动作足够远时才保留
+                    if (curr_center - last_center) > min_gap:
                         final_segments.append(candidate_segments[i])
+                        last_center = curr_center
             else:
                 final_segments = candidate_segments
-            
-            # 记录当前文件产生了多少个动作样本，用于平衡静息数据
+
+            # --- 5. 切片与增强 ---
             action_samples_count = 0 
             
             for seg_idx, seg in enumerate(final_segments):
                 segment_data = data_clean[seg['start']:seg['end']]
                 
-                # Z-Score 归一化
+                # Z-Score 归一化 (使用段内统计量)
                 seg_mean = np.mean(segment_data, axis=0)
                 seg_std = np.std(segment_data, axis=0)
                 segment_norm = (segment_data - seg_mean) / (seg_std + 1e-6)
                 
+                # 滑动窗口切片
                 for w_start in range(0, len(segment_norm) - WINDOW_SIZE, current_stride_size):
                     window = segment_norm[w_start : w_start + WINDOW_SIZE]
                     
-                    # 动作样本 (Base)
+                    # 原始样本
                     X_list.append(window)
-                    y_list.append(label) # 原始标签
+                    y_list.append(label)
                     groups_list.append(f"{f}_act_{seg_idx}")
                     action_samples_count += 1
                     
-                    # 动作增强 (Few-shot)
+                    # 增强样本 (Few-shot)
                     for _ in range(multiplier - 1):
                         aug_window = window.copy()
                         if enable_warp and np.random.random() > 0.3: aug_window = time_warp(aug_window)
@@ -250,14 +300,15 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
                         y_list.append(label)
                         groups_list.append(f"{f}_act_{seg_idx}_aug")
 
-            # PART B: 提取静息样本 (Label = 0)
+            # --- 6. 提取静息样本 (Rest) ---
             if enable_rest:  
-                rest_mask = ~mask 
+                # 注意：静息样本应从 mask 之外提取，mask 应该包含所有被视为"活动"的区域
+                # 为了安全，我们对原始 VAD 结果取反，而不是 refine 后的，以避免把剔除的噪音当成静息
+                rest_mask_base = ~raw_mask 
                 safe_margin = int(0.1 * FS)
-                rest_mask = ndimage.binary_erosion(rest_mask, structure=np.ones(safe_margin))
-                labeled_rest, num_rest = ndimage.label(rest_mask)
+                rest_mask_base = ndimage.binary_erosion(rest_mask_base, structure=np.ones(safe_margin))
+                labeled_rest, num_rest = ndimage.label(rest_mask_base)
                 
-                # 计算需要多少静息样本
                 target_rest_count = int(action_samples_count * multiplier * rest_ratio_per_file) 
                 if target_rest_count < 5: target_rest_count = 5
 
@@ -281,13 +332,9 @@ def process_selected_files(file_list, progress_callback=None, use_rhythm_filter=
                     selected_indices = indices[:target_rest_count]
                     
                     for idx in selected_indices:
-                        win = all_rest_windows[idx]
-                        X_list.append(win)
-                        y_list.append(0) # 标签 0
+                        X_list.append(all_rest_windows[idx])
+                        y_list.append(0) # Label 0 for Rest
                         groups_list.append(f"{f}_rest")
-                        # 仅在需要时微量增强静息
-                        if enable_noise and np.random.random() > 0.5:
-                             pass 
 
         except Exception as e:
             print(f"Error processing {f}: {e}")

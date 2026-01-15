@@ -183,7 +183,8 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
                                 samples_per_group, vote_weight, 
                                 st_progress_bar, st_status_text,
                                 use_mixup=False, 
-                                label_smoothing=0.0):
+                                label_smoothing=0.0,
+                                voting_start_epoch=0):
     
     # 1. 确定 Loss 函数
     # 如果用 Mixup 或 Smoothing，必须用 CategoricalCrossentropy (支持软标签)
@@ -207,6 +208,13 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
     
     for epoch in range(epochs):
         epoch_loss_avg = tf.keras.metrics.Mean()
+
+        if vote_weight == 0.0 or epoch < voting_start_epoch:
+            current_vote_weight = 0.0
+            status_prefix = "🟢 [基础训练]"
+        else:
+            current_vote_weight = vote_weight
+            status_prefix = "🔵 [投票介入]"
         
         # 获取分组数据生成器
         data_gen = group_batch_generator(X_train, y_train, groups_train, batch_size, samples_per_group)
@@ -255,8 +263,8 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
                 # 这其实起到了正则化作用。
                 
                 loss_vote = loss_fn(y_batch_onehot, avg_preds)
-                
-                total_loss = (1.0 - vote_weight) * loss_instance + vote_weight * loss_vote
+
+                total_loss = (1.0 - current_vote_weight) * loss_instance + current_vote_weight * loss_vote
 
             grads = tape.gradient(total_loss, model.trainable_weights)
             optimizer.apply_gradients(zip(grads, model.trainable_weights))
@@ -286,6 +294,6 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
         
         progress = (epoch + 1) / epochs
         st_progress_bar.progress(progress)
-        st_status_text.text(f"Epoch {epoch+1}/{epochs} | Loss: {curr_loss:.4f} | Train Acc: {train_acc:.1%} | Val Acc: {val_acc:.1%}")
+        st_status_text.text(f"{status_prefix} Epoch {epoch+1}/{epochs} | Loss: {curr_loss:.4f} (VoteWt: {current_vote_weight}) | Train Acc: {train_acc:.1%} | Val Acc: {val_acc:.1%}")
         
     return history

@@ -134,6 +134,13 @@ with st.sidebar:
         c1, c2 = st.columns(2)
         voting_weight = c1.slider("投票 Loss 权重", 0.1, 0.9, 0.5)
         samples_per_group = c2.slider("每组采样切片数", 2, 20, 5)
+        
+        # [NEW] 新增：投票介入时机
+        voting_start_epoch = st.slider("投票介入 Epoch (Warm-up)", 0, 50, 10, 
+                                       help="前 N 轮只训练基础准确率，之后再开启投票约束，防止初期梯度混乱。")
+    else:
+        # 给默认值防止报错
+        voting_start_epoch = 0
 
     st.markdown("---")
     split_mode = st.radio("验证策略", ("1. 混合切分", "2. 留文件验证", "3. 留日期/对象验证"))
@@ -177,6 +184,8 @@ if run_btn and target_files:
     
     status_text.text("处理完成！")
     progress_bar.progress(100)
+
+    X = X.astype(np.float32)
     
     if len(X) == 0:
         st.error("样本数为 0，请检查数据。")
@@ -258,7 +267,8 @@ if run_btn and target_files:
             st_progress_bar=train_progress,
             st_status_text=train_status,
             use_mixup=use_mixup,
-            label_smoothing=label_smoothing
+            label_smoothing=label_smoothing,
+            voting_start_epoch=voting_start_epoch if use_voting_loss else 0
         )
         
         class HistoryShim:
@@ -344,61 +354,70 @@ if run_btn and target_files:
     report_df = pd.DataFrame(report_dict).transpose()
     st.dataframe(report_df.style.background_gradient(cmap='Greens', subset=['f1-score']))
 
-    # 4. 基于投票的“分动作”准确率 (Per-Class Segment Accuracy)
-    st.write("#### (3) 🗳️ 动作片段级投票详情 (Segment Level Analysis)")
+    st.markdown("---")
     
-    # --- 投票逻辑 ---
-    test_groups = groups[test_idx]
-    voting_results = {}
+    # 逻辑：如果开启了投票训练，默认展开；否则默认折叠，需手动勾选查看
+    show_segment_analysis = use_voting_loss
     
-    # 收集每个片段的票数
-    for i, g in enumerate(test_groups):
-        if g not in voting_results: 
-            voting_results[g] = {'true': y_test_mapped[i], 'preds': []}
-        voting_results[g]['preds'].append(y_pred[i])
-    
-    # 统计结果
-    segment_stats = {} # 记录每个类别的 {total: 0, correct: 0}
-    for cls in label_map.keys():
-        segment_stats[cls] = {'total': 0, 'correct': 0}
+    if not use_voting_loss:
+        st.caption("ℹ️ 提示：虽然未开启投票训练，但您仍可以通过“后处理投票”来评估模型在完整动作上的表现。")
+        show_segment_analysis = st.checkbox("🔍 显示片段级平滑/投票评估 (Segment Level Evaluation)", value=False)
 
-    total_segments = 0
-    total_correct = 0
+    if show_segment_analysis:
+        st.write("#### (3) 🗳️ 动作片段级投票详情 (Segment Level Analysis)")
+        
+        # --- 投票逻辑 (保持原有逻辑不变) ---
+        test_groups = groups[test_idx]
+        voting_results = {}
+        
+        # 收集每个片段的票数
+        for i, g in enumerate(test_groups):
+            if g not in voting_results: 
+                voting_results[g] = {'true': y_test_mapped[i], 'preds': []}
+            voting_results[g]['preds'].append(y_pred[i])
+        
+        # 统计结果
+        segment_stats = {} # 记录每个类别的 {total: 0, correct: 0}
+        for cls in label_map.keys():
+            segment_stats[cls] = {'total': 0, 'correct': 0}
 
-    for res in voting_results.values():
-        true_label = res['true']
-        # 找到票数最多的类别
-        vote_pred = np.argmax(np.bincount(res['preds'], minlength=num_classes))
-        
-        # 转换回原始 Label 名称以便统计
-        true_label_name = list(label_map.keys())[list(label_map.values()).index(true_label)]
-        
-        segment_stats[true_label_name]['total'] += 1
-        total_segments += 1
-        if vote_pred == true_label:
-            segment_stats[true_label_name]['correct'] += 1
-            total_correct += 1
+        total_segments = 0
+        total_correct = 0
+
+        for res in voting_results.values():
+            true_label = res['true']
+            # 找到票数最多的类别
+            vote_pred = np.argmax(np.bincount(res['preds'], minlength=num_classes))
             
-    # 计算总投票准确率
-    segment_acc = total_correct / total_segments if total_segments > 0 else 0
-    
-    # 显示大字指标
-    st.metric(" 最终段级准确率 (Segment Accuracy)", f"{segment_acc*100:.2f}%", 
-              help="这是实际使用时的预期准确率（经过投票修正后）")
-    
-    # 显示分动作详情表
-    st.caption("👇 每个动作独立表现：")
-    per_class_data = []
-    for cls, stat in segment_stats.items():
-        acc = (stat['correct'] / stat['total']) * 100 if stat['total'] > 0 else 0
-        per_class_data.append({
-            "动作ID (Label)": cls,
-            "片段总数": stat['total'],
-            "正确识别数": stat['correct'],
-            "准确率 (%)": f"{acc:.1f}%"
-        })
-    
-    st.table(pd.DataFrame(per_class_data))
+            # 转换回原始 Label 名称以便统计
+            true_label_name = list(label_map.keys())[list(label_map.values()).index(true_label)]
+            
+            segment_stats[true_label_name]['total'] += 1
+            total_segments += 1
+            if vote_pred == true_label:
+                segment_stats[true_label_name]['correct'] += 1
+                total_correct += 1
+                
+        # 计算总投票准确率
+        segment_acc = total_correct / total_segments if total_segments > 0 else 0
+        
+        # 显示大字指标
+        st.metric(" 最终段级准确率 (Segment Accuracy)", f"{segment_acc*100:.2f}%", 
+                  help="这是模拟实际使用时的预期准确率（对整个动作片段取多数票）")
+        
+        # 显示分动作详情表
+        st.caption("👇 每个动作独立表现：")
+        per_class_data = []
+        for cls, stat in segment_stats.items():
+            acc = (stat['correct'] / stat['total']) * 100 if stat['total'] > 0 else 0
+            per_class_data.append({
+                "动作ID (Label)": cls,
+                "片段总数": stat['total'],
+                "正确识别数": stat['correct'],
+                "准确率 (%)": f"{acc:.1f}%"
+            })
+        
+        st.table(pd.DataFrame(per_class_data))
 
 # --- F. 模型保存 ---
 if st.session_state['trained_model']:

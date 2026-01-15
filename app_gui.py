@@ -21,7 +21,14 @@ def parse_filename(filename):
 def load_data(path):
     df = pd.read_csv(path)
     cols = [c for c in df.columns if 'CH' in c]
-    return df[cols].values, df['Timestamp'].values if 'Timestamp' in df.columns else None
+    data = df[cols].values  # 将变量名存为 data 以便操作
+    
+    # === CH5 信号修正 ===
+    if data.shape[1] >= 5:
+        data[:, 4] = data[:, 4] * 2.5
+    # =========================
+
+    return data, df['Timestamp'].values if 'Timestamp' in df.columns else None
 
 def refine_mask_logic(mask, fs):
     """
@@ -203,6 +210,30 @@ if submitted or 'filtered' not in locals():
                 use_notch=use_notch,      
                 notch_freq=notch_freq    
             )
+
+            temp_labeled, temp_num = ndimage.label(final_mask)
+            
+            if temp_num > 0:
+                seg_energies = []
+                # 1. 计算所有段的能量
+                for i in range(1, temp_num + 1):
+                    loc = np.where(temp_labeled == i)[0]
+                    # 注意：filtered 是 (Samples, Channels)
+                    seg_slice = filtered[loc[0]:loc[-1]] 
+                    # 计算 RMS：先对 Time(axis=0) 平方平均开根，再对 Channels 平均
+                    rms = np.mean(np.sqrt(np.mean(seg_slice**2, axis=0)))
+                    seg_energies.append(rms)
+                
+                # 2. 过滤异常
+                median_E = np.median(seg_energies)
+                upper_limit = median_E * 5.0
+                
+                for i in range(1, temp_num + 1):
+                    # 对应的能量索引是 i-1
+                    if seg_energies[i-1] > upper_limit:
+                        # 在 final_mask 中抹除该段
+                        loc = np.where(temp_labeled == i)[0]
+                        final_mask[loc] = False
             
             # 节奏过滤
             labeled_mask, num_features = ndimage.label(final_mask)
