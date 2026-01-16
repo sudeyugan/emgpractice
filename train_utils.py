@@ -160,7 +160,6 @@ def group_batch_generator(X, y, groups, batch_size, samples_per_group=5):
     
     for i in range(0, num_groups, batch_size):
         batch_groups = unique_groups[i : i + batch_size]
-        if len(batch_groups) < batch_size: continue # 丢弃最后不足的一个batch
         
         batch_X = []
         batch_y = []

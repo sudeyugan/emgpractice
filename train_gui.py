@@ -295,11 +295,25 @@ if run_btn and target_files:
             # === [MODIFIED] 修改微调逻辑 ===
             if unfreeze_all:
                 # 策略 A: SGD 接力训练 (全量微调)
-                base_model.trainable = True # 核心：允许更新所有权重
+                base_model.trainable = True 
                 
-                # 直接使用基模型，不加新层 (假设类别数没变)
-                # 如果类别数变了，需要在这里做额外的层替换逻辑，但通常 Adam->SGD 是同任务
-                model = base_model
+                # [FIX] 检查类别数是否一致，如果不一致必须重置分类头
+                # 获取基模型最后一层的输出维度
+                old_classes = base_model.output_shape[-1]
+                
+                if old_classes == num_classes:
+                    st.info(f"类别数一致 ({num_classes})，保持原输出层结构。")
+                    model = base_model
+                else:
+                    st.warning(f"检测到类别数变化 (基模型: {old_classes} -> 当前: {num_classes})，正在重置分类头...")
+                    # 剥离旧的分类头 (假设最后一层是 Dense)
+                    # 寻找倒数第二个特征层 (通常是 GlobalAveragePooling 或 Dropout)
+                    # 这里采用一种比较通用的做法：取倒数第二层的输出
+                    feature_output = base_model.layers[-2].output 
+                    
+                    # 重新接一个新的分类层
+                    new_output = tf.keras.layers.Dense(num_classes, activation='softmax', name="new_dense_head")(feature_output)
+                    model = tf.keras.models.Model(inputs=base_model.input, outputs=new_output)
                 
                 st.success(f"已加载模型用于 SGD 微调，所有层均可训练。")
                 

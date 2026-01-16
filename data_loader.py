@@ -35,55 +35,98 @@ def parse_filename_info(filepath):
     
     return subject, date, label, filename
 
-def refine_mask_logic(mask):
+def refine_mask_logic(mask, fs, energy=None):
     """
-    [移植自 app_gui.py] 业务逻辑优化掩码：
-    1. > 5s: 视为粘连，尝试断开。
-    2. 1s < len <= 5s: 丢弃。
-    3. 500ms < len <= 1s: 截取中间 500ms。
-    4. <= 500ms: 保留。
+    优化后的掩码逻辑：
+    1. 识别并屏蔽持续噪音（及其前后1s区域）。
+    2. 处理粘连的长动作。
+    3. 过滤过短的碎片。
     """
     labeled, num = ndimage.label(mask)
     new_mask = np.zeros_like(mask, dtype=bool)
-    samples_500ms = int(0.5 * FS)
+    
+    # [NEW] 1. 定义一个“噪音屏蔽罩”，初始化为全 False
+    noise_ban_mask = np.zeros_like(mask, dtype=bool)
+    
+    # 常用时间常数
+    samples_1s = int(1.0 * fs)      # 1秒对应的点数 (用于屏蔽)
+    samples_500ms = int(0.5 * fs)   # 500ms (用于截取)
+    structure_len = int(0.4 * fs)   # 400ms (用于切断粘连)
     
     for i in range(1, num + 1):
         loc = np.where(labeled == i)[0]
         if len(loc) == 0: continue
         
-        duration_ms = (len(loc) / FS) * 1000
+        duration_ms = (len(loc) / fs) * 1000
         
+        # --- A. 处理长片段 (>5s) ---
         if duration_ms > 5000:
-            # 处理粘连：腐蚀操作尝试断开
+            is_noise = False
+            
+            # [噪音检测] CV 变异系数逻辑
+            if energy is not None:
+                seg_energy = energy[loc]
+                mean_e = np.mean(seg_energy)
+                std_e = np.std(seg_energy)
+                cv = std_e / (mean_e + 1e-6)
+                
+                # 如果是平稳噪音 (CV < 0.2)
+                if cv < 0.2: 
+                    is_noise = True
+                    # 核心逻辑：建立噪音禁区
+                    # 将该片段的范围，以及前后 1s 的范围，都在 ban_mask 中标记为 True
+                    ban_start = max(0, loc[0] - samples_1s)
+                    ban_end = min(len(mask), loc[-1] + samples_1s)
+                    noise_ban_mask[ban_start:ban_end] = True
+            
+            # 如果确认是噪音，直接跳过处理（不用往 new_mask 里加东西了）
+            if is_noise:
+                continue
+
+            # [粘连处理] 如果不是噪音，但太长，说明是粘连动作 -> 尝试切开
             seg_mask = np.zeros_like(mask)
             seg_mask[loc] = True
-            structure = np.ones(int(0.2 * FS)) # 0.2s 的结构元素
+            
+            structure = np.ones(structure_len) 
             opened_mask = ndimage.binary_opening(seg_mask, structure=structure)
             sub_labeled, sub_num = ndimage.label(opened_mask)
+            
             for j in range(1, sub_num + 1):
                 sub_loc = np.where(sub_labeled == j)[0]
-                sub_dur = (len(sub_loc) / FS) * 1000
-                if sub_dur <= 1000: # 拆分后符合条件的
-                    if 500 < sub_dur <= 1000:
+                sub_dur = (len(sub_loc) / fs) * 1000
+                
+                # 子片段长度检查
+                if sub_dur <= 1000:
+                    if 500 < sub_dur <= 1000: # 取中间
                         center = int(np.mean(sub_loc))
                         half = samples_500ms // 2
                         s = max(0, center - half)
                         e = min(len(mask), center + half)
                         new_mask[s:e] = True
-                    else:
+                    else: # < 500ms 的子片段通常是切分产生的合法短动作
                         new_mask[sub_loc] = True
+            
+        # --- B. 处理中等片段 (被丢弃) ---
         elif 1000 < duration_ms <= 5000:
-            continue # 丢弃
+            continue
+            
+        # --- C. 处理短片段 (500ms ~ 1s) -> 取中间 ---
         elif 500 < duration_ms <= 1000:
-            # 截取中间 500ms
             center = int(np.mean(loc))
             half = samples_500ms // 2
             start = max(0, center - half)
             end = min(len(mask), center + half)
             new_mask[start:end] = True
-        else:
-            new_mask[loc] = True # 保留短动作
             
+        # --- D. 处理极短片段 (<= 500ms) -> 保留 ---
+        else:
+            new_mask[loc] = True
+            
+    # 2. 最终过滤：应用噪音屏蔽罩
+    # 任何落在“禁区”内的有效信号（new_mask 为 True 的点），如果 noise_ban_mask 也是 True，就被强制置为 False
+    # 也就是：new_mask = new_mask AND (NOT noise_ban_mask)
+    new_mask[noise_ban_mask] = False
+    
     return new_mask
 
 def time_warp(data, sigma=0.2, knot=4):

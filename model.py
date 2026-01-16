@@ -182,7 +182,7 @@ def build_dual_stream_model(input_shape, num_classes):
     
     # 2. 计算 STFT
     # frame_length=64, frame_step=32 对应约 64ms 窗口
-    stft = layers.Lambda(lambda x: tf.signal.stft(x, frame_length=64, frame_step=32))(merged_channel)
+    stft = layers.Lambda(lambda x: tf.signal.stft(x, frame_length=256, frame_step=32))(merged_channel)
     stft = layers.Lambda(lambda x: tf.abs(x))(stft) # 取幅值 (B, T_frames, Freq_bins)
     stft = layers.Lambda(lambda x: tf.expand_dims(x, -1))(stft) # 增加通道维变成图片 (B, H, W, 1)
     
