@@ -41,9 +41,27 @@ st.sidebar.header("🚀 训练模式")
 train_mode = st.sidebar.radio("选择模式", ["从零开始训练", "基于基模型微调 (Few-shot)"])
 
 base_model_path = None
+unfreeze_all = False
 if train_mode == "基于基模型微调 (Few-shot)":
     base_model_path = st.sidebar.file_uploader("上传基模型 (.h5)", type=["h5"])
-    num_finetune_samples = st.sidebar.slider("每个类别用于微调的样本数", 1, 10, 5)
+    
+    st.sidebar.markdown("---")
+    st.sidebar.caption("微调策略")
+    # === 全量微调开关 ===
+    unfreeze_all = st.sidebar.checkbox(
+        " 解冻所有层 (Full Fine-tuning)", 
+        value=False,
+        help="勾选此项用于 SGD 接力训练。如果不勾选，则默认为冻结特征层只训练分类头。"
+    )
+    # ===============================
+    
+    if not unfreeze_all:
+        num_finetune_samples = st.sidebar.slider("每个类别用于微调的样本数", 1, 10, 5)
+    else:
+        # 如果是全量微调，通常使用全部数据，或者也可以由用户指定
+        # 这里为了兼容，可以保持显示，或者提示用户
+        st.sidebar.info("已启用全量微调：SGD 将更新模型所有参数。")
+        num_finetune_samples = 99999
 
 with st.sidebar:
     st.header("1. 数据选择")
@@ -126,6 +144,38 @@ with st.sidebar:
         "New: Dual-Stream (Time + Freq Fusion)": build_dual_stream_model
     }
     model_choice = st.selectbox("选择模型架构", list(model_options.keys()), index=1)
+
+    st.caption("🔧 优化器配置")
+    
+    # 布局：左边选优化器，右边填基础学习率
+    c_opt1, c_opt2 = st.columns([1, 1])
+    with c_opt1:
+        # 这里的选项对应我们在调研中选出的几个
+        optimizer_name = st.selectbox(
+            "选择优化器", 
+            ["Adam (Default)", "AdamW (SOTA)", "Nadam (RNN+)", "SGD (Expert)"], 
+            index=0
+        )
+    with c_opt2:
+        learning_rate = st.number_input(
+            "学习率", 
+            value=0.001, format="%.6f", step=0.0001,
+            help="通常 Adam/Nadam 用 1e-3, SGD 建议 1e-2 或更小"
+        )
+
+    # 动态参数区域：根据选择显示特定参数
+    opt_params = {}
+    if "AdamW" in optimizer_name:
+        # AdamW 核心参数是 weight_decay
+        st.caption("🌊 AdamW 专属设置")
+        wd = st.number_input("权重衰减 (Weight Decay)", value=1e-4, format="%.5f", step=1e-5, help="推荐 1e-4 ~ 1e-2")
+        opt_params['weight_decay'] = wd
+        
+    elif "SGD" in optimizer_name:
+        # SGD 必须配合 Momentum 才好用
+        st.caption("🏎️ SGD 专属设置")
+        momentum = st.slider("动量 (Momentum)", 0.0, 0.99, 0.9, 0.01, help="通常设置为 0.9")
+        opt_params['momentum'] = momentum
     
     # 高级技巧开关
     use_mixup = st.checkbox("🧪 启用 Mixup 数据混合", value=False, help="混合两个样本及标签，提升泛化能力")
@@ -201,6 +251,22 @@ if run_btn and target_files:
     
     # --- B. 模型训练准备 ---
     st.subheader("2. 模型训练")
+    if "AdamW" in optimizer_name:
+        # 需要 TF 2.10+，如果报错请降级回 Adam
+        try:
+            optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=opt_params['weight_decay'])
+        except AttributeError:
+            st.error("您的 TensorFlow 版本过低，不支持 AdamW，已自动切换回 Adam。")
+            optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+            
+    elif "Nadam" in optimizer_name:
+        optimizer = tf.keras.optimizers.Nadam(learning_rate=learning_rate)
+        
+    elif "SGD" in optimizer_name:
+        optimizer = tf.keras.optimizers.SGD(learning_rate=learning_rate, momentum=opt_params['momentum'])
+        
+    else: # Default Adam
+        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
     
     if train_mode == "基于基模型微调 (Few-shot)":
         train_idx, test_idx = train_utils.get_few_shot_split(X, y, num_finetune_samples)
@@ -222,27 +288,46 @@ if run_btn and target_files:
     # 构建模型
     if train_mode == "基于基模型微调 (Few-shot)":
         if base_model_path:
+            # 1. 保存并加载基模型
             with open("temp_model.h5", "wb") as f: f.write(base_model_path.getbuffer())
             base_model = tf.keras.models.load_model("temp_model.h5")
-            base_model.trainable = False 
             
-            feature_output = None
-            for layer in reversed(base_model.layers):
-                if "global_average_pooling" in layer.name or "flatten" in layer.name:
-                    feature_output = layer.output
-                    break
-            if feature_output is None: feature_output = base_model.layers[-3].output
+            # === [MODIFIED] 修改微调逻辑 ===
+            if unfreeze_all:
+                # 策略 A: SGD 接力训练 (全量微调)
+                base_model.trainable = True # 核心：允许更新所有权重
+                
+                # 直接使用基模型，不加新层 (假设类别数没变)
+                # 如果类别数变了，需要在这里做额外的层替换逻辑，但通常 Adam->SGD 是同任务
+                model = base_model
+                
+                st.success(f"已加载模型用于 SGD 微调，所有层均可训练。")
+                
+            else:
+                # 策略 B: Few-shot (冻结特征提取器) - 保持你原来的代码
+                base_model.trainable = False 
+                
+                feature_output = None
+                for layer in reversed(base_model.layers):
+                    if "global_average_pooling" in layer.name or "flatten" in layer.name:
+                        feature_output = layer.output
+                        break
+                if feature_output is None: feature_output = base_model.layers[-3].output
+                
+                x = feature_output
+                x = tf.keras.layers.Dropout(0.5, name="ft_dropout_1")(x) 
+                x = tf.keras.layers.Dense(64, activation='relu', 
+                                          kernel_regularizer=tf.keras.regularizers.l2(0.01),
+                                          name="ft_dense_1")(x)
+                x = tf.keras.layers.Dropout(0.3, name="ft_dropout_2")(x)
+                outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
+                
+                model = tf.keras.models.Model(inputs=base_model.input, outputs=outputs)
+            # ==============================
+
+            # 编译模型 (使用你在上一轮对话中添加的 optimizer)
+            model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
             
-            x = feature_output
-            x = tf.keras.layers.Dropout(0.5, name="ft_dropout_1")(x) 
-            x = tf.keras.layers.Dense(64, activation='relu', 
-                                      kernel_regularizer=tf.keras.regularizers.l2(0.01),
-                                      name="ft_dense_1")(x)
-            x = tf.keras.layers.Dropout(0.3, name="ft_dropout_2")(x)
-            outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
-            
-            model = tf.keras.models.Model(inputs=base_model.input, outputs=outputs)
-            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
         else:
             st.error("请上传基模型 (.h5 文件)")
             st.stop()
@@ -251,7 +336,7 @@ if run_btn and target_files:
         selected_builder = model_options[model_choice]
         model = selected_builder(input_shape, num_classes)
         
-        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
     # --- C. 开始训练 (分支逻辑) ---
     st.caption("训练监控")
@@ -274,7 +359,8 @@ if run_btn and target_files:
             st_status_text=train_status,
             use_mixup=use_mixup,
             label_smoothing=label_smoothing,
-            voting_start_epoch=voting_start_epoch if use_voting_loss else 0
+            voting_start_epoch=voting_start_epoch if use_voting_loss else 0,
+            optimizer=optimizer
         )
         
         class HistoryShim:
@@ -314,7 +400,12 @@ if run_btn and target_files:
         'test_idx': test_idx,
         'y_pred': y_pred,
         'label_map': label_map,
-        'class_names': [str(k) for k in label_map.keys()]
+        'class_names': [str(k) for k in label_map.keys()],
+        'optimizer_info': {
+            'name': optimizer_name,
+            'lr': learning_rate,
+            'params': opt_params # 这是我们在 UI 部分定义的那个字典
+        }
     }
     
     # 更新全局模型状态
@@ -449,6 +540,7 @@ if st.session_state['train_results'] is not None:
     log_content.append(f"   EMG 训练实验报告")
     log_content.append(f"   时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log_content.append(f"========================================\n")
+    opt_info = res.get('optimizer_info', {'name': 'Unknown', 'lr': 0, 'params': {}})
     
     log_content.append(f"[1. 数据配置]")
     log_content.append(f"测试对象 (Subjects): {selected_subjects}")
@@ -460,6 +552,10 @@ if st.session_state['train_results'] is not None:
     
     log_content.append(f"[2. 模型与训练配置]")
     log_content.append(f"模型架构: {model_choice}")
+    log_content.append(f"优化器 (Optimizer): {opt_info['name']}")
+    log_content.append(f"学习率 (Learning Rate): {opt_info['lr']}")
+    if opt_info['params']:
+        log_content.append(f"优化器参数 (Params): {json.dumps(opt_info['params'], ensure_ascii=False)}")
     log_content.append(f"验证策略: {selected_strategy}")
     log_content.append(f"Epochs: {epochs}")
     log_content.append(f"Batch Size: {batch_size}")

@@ -184,16 +184,25 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
                                 st_progress_bar, st_status_text,
                                 use_mixup=False, 
                                 label_smoothing=0.0,
-                                voting_start_epoch=0):
+                                voting_start_epoch=0,
+                                optimizer=None):
     
     # 1. 确定 Loss 函数
     # 如果用 Mixup 或 Smoothing，必须用 CategoricalCrossentropy (支持软标签)
-    loss_fn = tf.keras.losses.CategoricalCrossentropy(label_smoothing=label_smoothing)
-    optimizer = tf.keras.optimizers.Adam()
+    loss_fn = tf.keras.losses.CategoricalCrossentropy(label_smoothing=label_smoothing)  
+    if optimizer is None:
+        optimizer = tf.keras.optimizers.Adam()
+    
+    best_val_loss = float('inf')
+    wait = 0
+    patience = 5      # 与标准模式保持一致
+    factor = 0.2      # 衰减系数
+    min_lr = 1e-6     # 最小学习率
 
     # 2. 准备 Metrics
     train_acc_metric = tf.keras.metrics.CategoricalAccuracy()
     val_acc_metric = tf.keras.metrics.CategoricalAccuracy()
+    val_loss_metric = tf.keras.metrics.Mean()
     
     history = {'accuracy': [], 'loss': [], 'val_accuracy': [], 'val_loss': []}
     
@@ -231,7 +240,7 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
             y_flat_int = np.repeat(y_batch, N)
             y_flat_onehot = tf.one_hot(y_flat_int, depth=num_classes)
             
-            # [NEW] 应用 Mixup
+            # 应用 Mixup
             if use_mixup:
                 # Mixup 会改变 x_flat 和 y_flat_onehot 的值
                 x_flat, y_flat_onehot = mixup(x_flat, y_flat_onehot, alpha=0.2)
@@ -271,15 +280,20 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
             
             epoch_loss_avg.update_state(total_loss)
             train_acc_metric.update_state(y_flat_onehot, logits_flat)
-            
+
+        val_loss_metric.reset_state()
+
         # 验证步
         for x_val, y_val in val_dataset:
             val_logits = model(x_val, training=False)
             val_acc_metric.update_state(y_val, val_logits)
-            # 记录 val_loss
-            loss_val = loss_fn(y_val, val_logits)
 
-        # 记录
+            # 计算当前 batch loss
+            step_loss = loss_fn(y_val, val_logits)
+            # 更新到平均统计器中
+            val_loss_metric.update_state(step_loss)    
+
+        loss_val = val_loss_metric.result()
         train_acc = train_acc_metric.result()
         val_acc = val_acc_metric.result()
         curr_loss = epoch_loss_avg.result()
@@ -288,12 +302,34 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
         history['loss'].append(float(curr_loss))
         history['val_accuracy'].append(float(val_acc))
         history['val_loss'].append(float(loss_val))
-        
+
         train_acc_metric.reset_state()
         val_acc_metric.reset_state()
+
+        current_lr = float(optimizer.learning_rate.numpy())
+
+        if loss_val < best_val_loss:
+            best_val_loss = loss_val
+            wait = 0 # Loss 创新低，重置等待计数器
+            # 可以在这里保存最佳权重 (ModelCheckpoint 逻辑)
+        else:
+            wait += 1
+            if wait >= patience:
+                new_lr = max(current_lr * factor, min_lr)
+                if current_lr > new_lr: # 只有当需要降低时才操作
+                    optimizer.learning_rate.assign(new_lr)
+                    wait = 0 # 重置等待
         
         progress = (epoch + 1) / epochs
         st_progress_bar.progress(progress)
-        st_status_text.text(f"{status_prefix} Epoch {epoch+1}/{epochs} | Loss: {curr_loss:.4f} (VoteWt: {current_vote_weight}) | Train Acc: {train_acc:.1%} | Val Acc: {val_acc:.1%}")
+        
+        # [MODIFIED] 在状态栏显示当前学习率
+        st_status_text.text(
+            f"Epoch {epoch+1}/{epochs} | "
+            f"LR: {current_lr:.1e} | "  # 显示 LR
+            f"Loss: {curr_loss:.4f} | "
+            f"Val Loss: {loss_val:.4f} | "
+            f"Acc: {train_acc:.1%} | Val: {val_acc:.1%}"
+        )
         
     return history
