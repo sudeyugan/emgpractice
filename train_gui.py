@@ -43,8 +43,8 @@ train_mode = st.sidebar.radio("选择模式", ["从零开始训练", "基于基�
 base_model_path = None
 unfreeze_all = False
 if train_mode == "基于基模型微调 (Few-shot)":
-    base_model_path = st.sidebar.file_uploader("上传基模型 (.h5)", type=["h5"])
-    
+    base_model_path = st.sidebar.file_uploader("上传基模型 (.h5/.keras)", type=["keras", "h5"])
+
     st.sidebar.markdown("---")
     st.sidebar.caption("微调策略")
     # === 全量微调开关 ===

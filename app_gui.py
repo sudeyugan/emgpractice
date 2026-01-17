@@ -102,11 +102,11 @@ def refine_mask_logic(mask, fs, energy=None):
                         new_mask[sub_loc] = True
             
         # --- B. 处理中等片段 (被丢弃) ---
-        elif 1000 < duration_ms <= 5000:
+        elif 2000 < duration_ms <= 5000:
             continue
-            
-        # --- C. 处理短片段 (500ms ~ 1s) -> 取中间 ---
-        elif 500 < duration_ms <= 1000:
+
+        # --- C. 处理短片段 (500ms ~ 2s) -> 取中间 ---
+        elif 500 < duration_ms <= 2000:
             center = int(np.mean(loc))
             half = samples_500ms // 2
             start = max(0, center - half)
@@ -311,33 +311,53 @@ if submitted or 'filtered' not in locals():
         # --- 图表 1: 宏观概览 ---
         st.subheader(f"📊 信号概览 (CH{view_ch+1}, 动作数: {num_display})")
         
-        # 【新增】定义降采样步长，每10个点取1个
         step = 10 
-        
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
         
-        # 注意：x轴 (t) 和 数据 (raw_data) 都要切片 [::step]
         t = np.arange(len(raw_data)) / fs
         t_down = t[::step]
         
-        # 绘图时全都加上 [::step]
-        ax1.plot(t_down, raw_data[::step, view_ch], color='lightgray', alpha=0.5, label=f'Raw CH{view_ch+1}')
+        # 绘图数据
+        ax1.plot(t_down, raw_data[::step, view_ch], color='lightgray', alpha=0.5, label='Raw')
         ax1.plot(t_down, filtered[::step, view_ch], color='#1f77b4', linewidth=1, label='Filtered')
-        
-        ax2.plot(t_down, energy[::step], color='orange', label='Global Energy')
-        # axhline 不需要切片，因为它是水平直线
+        ax2.plot(t_down, energy[::step], color='orange', label='Energy')
         ax2.axhline(threshold, color='red', linestyle='--', alpha=0.5)
         
-        # fill_between 需要特别处理，因为它是填充区域
-        # 如果用降采样可能导致边缘锯齿，但为了速度可以接受，或者保持原样（fill_between通常比plot快一点）
-        # 这里建议也降采样
-        ax2.fill_between(t_down, 0, np.max(energy), where=raw_mask[::step], color='lightgreen', alpha=0.3, label='Discarded Candidates')
-        ax2.fill_between(t_down, 0, np.max(energy), where=display_mask[::step], color='green', alpha=0.6, label='Accepted Segments')
+        # 填充背景
+        ax2.fill_between(t_down, 0, np.max(energy), where=raw_mask[::step], color='lightgreen', alpha=0.2)
+        ax2.fill_between(t_down, 0, np.max(energy), where=display_mask[::step], color='green', alpha=0.5)
+
+        # --- 视觉优化后的标注逻辑 ---
+        raw_labeled, raw_num = ndimage.label(raw_mask)
+        y_limit = np.max(energy) if len(energy) > 0 else 1.0
         
-        ax2.legend(loc='upper right')
+        for i in range(1, raw_num + 1):
+            loc = np.where(raw_labeled == i)[0]
+            if len(loc) == 0: continue
+            
+            is_accepted = np.any(display_mask[loc])
+            duration_ms = (len(loc) / fs) * 1000
+            
+            # 只对完全被舍弃 且 长度 > 50ms 的片段进行标注
+            if not is_accepted and duration_ms > 50:
+                t_start, t_end = loc[0] / fs, loc[-1] / fs
+                center_t = (t_start + t_end) / 2
+                
+                # 1. 在背景画一个极淡的红色条带，明确舍弃范围
+                ax2.axvspan(t_start, t_end, color='red', alpha=0.1)
+                
+                # 2. 顶部标注文字：旋转90度，带圆角边框，位置固定在顶部
+                ax2.text(center_t, y_limit * 0.95, f"{int(duration_ms)}ms", 
+                         color='darkred', fontsize=8, ha='center', va='top', 
+                         rotation=90, fontweight='bold',
+                         bbox=dict(facecolor='white', alpha=0.8, edgecolor='red', 
+                                   boxstyle='round,pad=0.2', linewidth=0.5))
+
+        # 完善图表并渲染
+        ax2.legend(loc='upper right', fontsize='small')
         ax2.set_xlabel('Time (s)')
-        st.pyplot(fig)
-        
+        st.pyplot(fig)  # 修复不出图的关键
+        plt.close(fig)
         # --- 详细交互区 (恢复 STFT 和 波形放大) ---
         st.markdown("---")
         st.subheader("🔍 动作切片详情")

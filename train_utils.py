@@ -193,6 +193,7 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
         optimizer = tf.keras.optimizers.Adam()
     
     best_val_loss = float('inf')
+    best_weights = model.get_weights()
     wait = 0
     patience = 5      # 与标准模式保持一致
     factor = 0.2      # 衰减系数
@@ -309,20 +310,23 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
 
         if loss_val < best_val_loss:
             best_val_loss = loss_val
+            best_weights = model.get_weights()
             wait = 0 # Loss 创新低，重置等待计数器
             # 可以在这里保存最佳权重 (ModelCheckpoint 逻辑)
         else:
-            wait += 1
             if wait >= patience:
                 new_lr = max(current_lr * factor, min_lr)
-                if current_lr > new_lr: # 只有当需要降低时才操作
+                if current_lr > new_lr: 
                     optimizer.learning_rate.assign(new_lr)
-                    wait = 0 # 重置等待
+                    wait = 0 
+                else:
+                    # 如果已经到了最小学习率且依然没有提升，则触发真正的早停
+                    break
         
         progress = (epoch + 1) / epochs
         st_progress_bar.progress(progress)
         
-        # [MODIFIED] 在状态栏显示当前学习率
+        # 在状态栏显示当前学习率
         st_status_text.text(
             f"Epoch {epoch+1}/{epochs} | "
             f"LR: {current_lr:.1e} | "  # 显示 LR
@@ -331,4 +335,5 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
             f"Acc: {train_acc:.1%} | Val: {val_acc:.1%}"
         )
         
+    model.set_weights(best_weights)
     return history

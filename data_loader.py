@@ -109,7 +109,7 @@ def refine_mask_logic(mask, fs, energy=None):
         # --- B. 处理中等片段 (被丢弃) ---
         elif 1000 < duration_ms <= 5000:
             continue
-            
+
         # --- C. 处理短片段 (500ms ~ 1s) -> 取中间 ---
         elif 500 < duration_ms <= 1000:
             center = int(np.mean(loc))
@@ -251,7 +251,7 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
             
             # A. 时长门控 (Refine) - GUI: 启用
             if ENABLE_REFINE:
-                final_mask = refine_mask_logic(raw_mask)
+                final_mask = refine_mask_logic(raw_mask, FS)
             else:
                 final_mask = raw_mask
                 
