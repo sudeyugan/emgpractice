@@ -288,9 +288,12 @@ if run_btn and target_files:
     # 构建模型
     if train_mode == "基于基模型微调 (Few-shot)":
         if base_model_path:
-            # 1. 保存并加载基模型
-            with open("temp_model.h5", "wb") as f: f.write(base_model_path.getbuffer())
-            base_model = tf.keras.models.load_model("temp_model.h5")
+            # 1. 保存并加载基模型 (兼容 .h5 和 .keras)
+            temp_ext = ".keras" if base_model_path.name.lower().endswith(".keras") else ".h5"
+            temp_model_file = f"temp_model{temp_ext}"
+            
+            with open(temp_model_file, "wb") as f: f.write(base_model_path.getbuffer())
+            base_model = tf.keras.models.load_model(temp_model_file)
             
             # === [MODIFIED] 修改微调逻辑 ===
             if unfreeze_all:

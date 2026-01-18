@@ -262,11 +262,13 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
                 indices = np.where(labeled_mask == i)[0]
                 # 再次校验长度 (refine_logic 已经做过，但为了安全)
                 if len(indices) > 0:
-                    candidate_segments.append({
-                        'start': indices[0],
-                        'end': indices[-1],
-                        'center': (indices[0] + indices[-1]) / 2
-                    })
+                    min_len = int(0.05 * FS)
+                    if len(indices) >= min_len:
+                        candidate_segments.append({
+                            'start': indices[0],
+                            'end': indices[-1],
+                            'center': (indices[0] + indices[-1]) / 2
+                        })
             
             if len(candidate_segments) > 0:
                 segment_energies = []
