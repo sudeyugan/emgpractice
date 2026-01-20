@@ -105,6 +105,28 @@ with st.sidebar:
     st.info(f"已选中 **{len(target_files)}** 个 CSV 文件")
 
     st.header("2. 增强与训练配置")
+
+    with st.expander("✂️ 动作分割设置", expanded=True):
+        seg_method = st.radio(
+            "分割算法", 
+            ["VAD 能量阈值 (自动检测起止)", "Fixed Rhythm 固定节奏峰值"], 
+            index=1, # 默认选中新的，方便你测试
+            help="VAD: 适合自由节奏；Fixed Rhythm: 适合严格按节拍器采集的数据"
+        )
+        
+        seg_config = {}
+        
+        if "VAD" in seg_method:
+            seg_config['method'] = 'vad'
+            st.caption("VAD 模式下，系统通过能量阈值自动判断动作长短。")
+        else:
+            seg_config['method'] = 'peak'
+            c_seg1, c_seg2 = st.columns(2)
+            seg_rhythm = c_seg1.number_input("节拍间隔 (ms)", 1000, 10000, 4000, step=500, help="例如 4秒做一次动作")
+            seg_win = c_seg2.number_input("截取窗口 (ms)", 200, 1000, 350, step=50, help="以峰值为中心，左右共截取多少毫秒")
+            
+            seg_config['rhythm_ms'] = seg_rhythm
+            seg_config['peak_win_ms'] = seg_win
     
     with st.expander("数据增强与采样", expanded=False):
         train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 200, 100)
@@ -179,7 +201,7 @@ with st.sidebar:
     
     # 高级技巧开关
     use_mixup = st.checkbox("🧪 启用 Mixup 数据混合", value=False, help="混合两个样本及标签，提升泛化能力")
-    label_smoothing = st.slider("Label Smoothing (标签平滑)", 0.0, 0.5, 0.0, 0.01, help="防止模型对标签过度自信，0.1通常是个好值")
+    label_smoothing = st.slider("Label Smoothing (标签平滑)", 0.0, 0.5, 0.0, 0.05, help="防止模型对标签过度自信，0.1通常是个好值")
     
     # 投票 Loss (保持不变)
     use_voting_loss = st.checkbox("🗳️ 开启投票机制辅助训练 (Vote Loss)", value=False)
@@ -192,7 +214,7 @@ with st.sidebar:
         samples_per_group = c2.slider("每组采样切片数", 2, 20, 5)
         
         # [NEW] 新增：投票介入时机
-        voting_start_epoch = st.slider("投票介入 Epoch (Warm-up)", 0, 50, 10, 
+        voting_start_epoch = st.slider("投票介入 Epoch (Warm-up)", 0, 50, 20, 
                                        help="前 N 轮只训练基础准确率，之后再开启投票约束，防止初期梯度混乱。")
     else:
         # 给默认值防止报错
@@ -216,7 +238,7 @@ with st.sidebar:
         manual_val_target = st.selectbox("🎯 指定测试对象/日期", group_options)
 
     st.markdown("---") 
-    epochs = st.number_input("Epochs", 10, 200, 50)
+    epochs = st.number_input("Epochs", 10, 200, 50, step=5)
     batch_size = st.selectbox("Batch Size (Groups if Voting)", [8, 16, 32, 64, 128, 256, 512], index=1)
     test_size = st.slider("测试集比例", 0.01, 0.5, 0.2)
     
@@ -235,7 +257,8 @@ if run_btn and target_files:
         target_files, 
         progress_callback=lambda p, t: (progress_bar.progress(p), status_text.text(t)),
         stride_ms=train_stride_ms,
-        augment_config=augment_config
+        augment_config=augment_config,
+        segmentation_config=seg_config
     )
     
     status_text.text("处理完成！")

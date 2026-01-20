@@ -23,10 +23,7 @@ TARGET_DATES = None                     # None 表示所有日期，或者写 ["
 # 2. 实验变量 (Grid Search)
 MODELS_TO_TEST = [
     # 格式: (模型名称, 构建函数)
-    ("Simple_CNN", model_lib.build_simple_cnn),
-    ("Advanced_CRNN", model_lib.build_advanced_crnn),
-    ("ResNet1D", model_lib.build_resnet_model),
-    ("TCN", model_lib.build_tcn_model)
+    ("Dual_Stream", model_lib.build_dual_stream_model)
 ]
 
 OPTIMIZERS_TO_TEST = [

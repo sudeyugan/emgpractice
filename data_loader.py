@@ -35,6 +35,96 @@ def parse_filename_info(filepath):
     
     return subject, date, label, filename
 
+def get_rhythm_mask(energy, fs, interval_ms=4000, window_ms=300, noise_cv_threshold=0.2):
+    """
+    [移植自 new_auto_train.py] 4s 固定节奏峰值提取逻辑 + 相位投票
+    """
+    mask = np.zeros_like(energy, dtype=bool)
+    
+    # 1. 寻找候选峰 (低阈值，先尽可能多抓)
+    min_dist = int(2.0 * fs) 
+    noise_floor = np.percentile(energy, 10)
+    # 这里的 1.5 倍底噪是一个比较宽容的初筛
+    peaks, _ = signal.find_peaks(energy, distance=min_dist, height=noise_floor * 1.5)
+    
+    if len(peaks) == 0:
+        return mask
+    
+    # 2. 相位投票 (Phase Voting) 确定锚点
+    interval_samples = int((interval_ms / 1000) * fs)
+    if interval_samples < 1: interval_samples = 1
+
+    phases = peaks % interval_samples
+    
+    bin_width = int(0.2 * fs) # 200ms 容差
+    bins = np.arange(0, interval_samples + bin_width, bin_width)
+    counts, bin_edges = np.histogram(phases, bins=bins)
+    
+    if len(counts) == 0: return mask
+
+    best_bin_idx = np.argmax(counts)
+    phase_start = bin_edges[best_bin_idx]
+    phase_end = bin_edges[best_bin_idx+1]
+    
+    # 筛选 On-beat peaks
+    candidates_mask = (phases >= phase_start) & (phases < phase_end)
+    candidates = peaks[candidates_mask]
+    
+    if len(candidates) > 0:
+        # 选能量最大的合群峰作为 Anchor
+        best_sub_idx = np.argmax(energy[candidates])
+        anchor_peak = candidates[best_sub_idx]
+    else:
+        anchor_peak = peaks[0]
+
+    # 3. 生成网格并搜索
+    half_win = int((window_ms / 1000) * fs) // 2
+    search_radius = int(1.0 * fs) # 在网格点前后 1s 搜索
+    valid_centers = []
+    max_len = len(energy)
+    
+    # Forward & Backward Search
+    for direction in [1, -1]:
+        curr_grid = anchor_peak if direction == 1 else anchor_peak - interval_samples
+        
+        while 0 <= curr_grid < max_len:
+            s_start = max(0, curr_grid - search_radius)
+            s_end = min(max_len, curr_grid + search_radius)
+            region = energy[s_start:s_end]
+            
+            if len(region) > 0:
+                local_max_idx = np.argmax(region)
+                abs_center = s_start + local_max_idx
+                # 再次校验峰值强度，防止提取到纯底噪 (1.2倍底噪)
+                if energy[abs_center] > noise_floor * 1.2:
+                    valid_centers.append(abs_center)
+            
+            if direction == 1: curr_grid += interval_samples
+            else: curr_grid -= interval_samples
+
+    valid_centers = sorted(list(set(valid_centers)))
+    
+    # 4. 生成 Mask (CV 过滤持续噪音)
+    for c in valid_centers:
+        s = max(0, c - half_win)
+        e = min(max_len, c + half_win)
+        
+        seg_vals = energy[s:e]
+        if len(seg_vals) == 0: continue
+
+        mean_e = np.mean(seg_vals)
+        std_e = np.std(seg_vals)
+        cv = std_e / (mean_e + 1e-6)
+        
+        ref_energy = energy[anchor_peak]
+        # 如果能量很大但 CV 很小 (平稳噪音)，剔除
+        if mean_e > ref_energy * 0.3 and cv < noise_cv_threshold:
+             continue
+             
+        mask[s:e] = True
+        
+    return mask
+
 def refine_mask_logic(mask, fs, energy=None):
     """
     优化后的掩码逻辑：
@@ -163,16 +253,31 @@ def scale_amplitude(data, scale_range=(0.8, 1.2)):
     factor = np.random.uniform(scale_range[0], scale_range[1])
     return data * factor
 
-def process_selected_files(file_list, progress_callback=None, stride_ms=100, augment_config=None):
+# data_loader.py
+
+# ... (保留原有的 imports 和辅助函数, 如 parse_filename_info, refine_mask_logic 等) ...
+
+def process_selected_files(file_list, progress_callback=None, stride_ms=100, augment_config=None, segmentation_config=None):
     """
-    核心处理流程：严格同步 app_gui.py 的信号处理链
-    Raw -> CH5 Gain -> Notch -> Bandpass -> Energy -> VAD -> Refine -> Rhythm -> Slice
+    核心处理流程：支持 VAD (阈值) 和 Peak (固定节奏) 两种模式
     """
     if augment_config is None: augment_config = {}
+    
+    # === 1. 解析分割配置 ===
+    # 默认为 VAD 模式以保持兼容性
+    if segmentation_config is None:
+        segmentation_config = {'method': 'vad'} 
+    
+    method = segmentation_config.get('method', 'vad')
+    
+    # Peak 模式特有参数
+    rhythm_ms = segmentation_config.get('rhythm_ms', 4000)      # 节奏间隔
+    peak_win_ms = segmentation_config.get('peak_win_ms', 350)  # 峰值左右截取的窗口大小
     
     # 增强配置
     multiplier = augment_config.get('multiplier', 1)
     enable_rest = augment_config.get('enable_rest', True)
+    # ... (其他增强参数获取保持不变) ...
     enable_warp = augment_config.get('enable_warp', False)
     enable_shift = augment_config.get('enable_shift', False)
     enable_mask = augment_config.get('enable_mask', False)
@@ -216,114 +321,125 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
             if raw_data.shape[1] >= 5:
                 raw_data[:, 4] = raw_data[:, 4] * 2.5
                 
-            # --- 2. 信号滤波链 (与 GUI 一致) ---
+            # --- 2. 信号滤波链 ---
             data_proc = raw_data.copy()
-            
-            # A. 工频陷波 (Notch) - GUI: 启用, 50Hz
             if ENABLE_NOTCH:
                 b_notch, a_notch = signal.iirnotch(NOTCH_FREQ, 30, FS)
                 data_proc = signal.filtfilt(b_notch, a_notch, data_proc, axis=0)
             
-            # B. 带通滤波 (Bandpass) - GUI: 20-450Hz
             b, a = signal.butter(4, [20, 450], btype='bandpass', fs=FS)
             data_clean = signal.filtfilt(b, a, data_proc, axis=0)
             
-            # --- 3. VAD 掩码生成 ---
             # 计算能量
             energy = np.sqrt(np.mean(data_clean**2, axis=1))
-            
-            # 平滑 - GUI: 100ms
             win_len = int((VAD_SMOOTH_MS/1000) * FS)
             energy_smooth = np.convolve(energy, np.ones(win_len)/win_len, mode='same')
             
-            # 阈值 - GUI: 0.15
+            # 基础阈值 (VAD和Peak模式都需要用到阈值来过滤明显的噪音区)
             noise_floor = np.percentile(energy_smooth, 10)
             peak_level = np.percentile(energy_smooth, 99)
             threshold = noise_floor + THRESHOLD_RATIO * (peak_level - noise_floor)
+
+            final_segments = []
             
-            raw_mask = energy_smooth > threshold
+            # ================= 分支逻辑开始 =================
             
-            # 合并间隙 - GUI: 200ms
-            gap_samples = int((VAD_MERGE_GAP_MS/1000) * FS)
-            raw_mask = ndimage.binary_closing(raw_mask, structure=np.ones(gap_samples))
-            
-            # --- 4. 过滤逻辑优化 (Refine & Rhythm) ---
-            
-            # A. 时长门控 (Refine) - GUI: 启用
-            if ENABLE_REFINE:
-                final_mask = refine_mask_logic(raw_mask, FS)
-            else:
-                final_mask = raw_mask
+            if method == 'peak':
+                # >>>>> 模式 A: 固定节奏峰值分割 (Peak Segmentation) <<<<<
                 
-            # 提取候选片段
-            labeled_mask, num_features = ndimage.label(final_mask)
-            candidate_segments = []
-            for i in range(1, num_features + 1):
-                indices = np.where(labeled_mask == i)[0]
-                # 再次校验长度 (refine_logic 已经做过，但为了安全)
-                if len(indices) > 0:
-                    min_len = int(0.05 * FS)
-                    if len(indices) >= min_len:
+                # 注意：GUI 传入的 rhythm_ms 是间隔，peak_win_ms 是窗口
+                rhythm_mask = get_rhythm_mask(
+                    energy_smooth, FS, 
+                    interval_ms=rhythm_ms, 
+                    window_ms=peak_win_ms,
+                    noise_cv_threshold=0.2
+                )
+                
+                # 将 Mask 转换为 segments 列表，以便后续代码复用
+                labeled, num_seg = ndimage.label(rhythm_mask)
+                
+                for i in range(1, num_seg + 1):
+                    loc = np.where(labeled == i)[0]
+                    # 确保片段长度足够
+                    if len(loc) > int(FS * 0.05): 
+                        final_segments.append({
+                            'start': loc[0],
+                            'end': loc[-1],
+                            'center': int(np.mean(loc))
+                        })
+                
+                # 更新 raw_mask (用于后续提取 Rest)
+                raw_mask = rhythm_mask
+                    
+            else:
+                # >>>>> 模式 B: 能量阈值 VAD (原逻辑) <<<<<
+                
+                raw_mask = energy_smooth > threshold
+                gap_samples = int((VAD_MERGE_GAP_MS/1000) * FS)
+                raw_mask = ndimage.binary_closing(raw_mask, structure=np.ones(gap_samples))
+                
+                if ENABLE_REFINE:
+                    final_mask = refine_mask_logic(raw_mask, FS, energy=energy_smooth)
+                else:
+                    final_mask = raw_mask
+                    
+                # 提取候选片段
+                labeled_mask, num_features = ndimage.label(final_mask)
+                candidate_segments = []
+                for i in range(1, num_features + 1):
+                    indices = np.where(labeled_mask == i)[0]
+                    if len(indices) > int(0.05 * FS): # 最小长度保护
                         candidate_segments.append({
                             'start': indices[0],
                             'end': indices[-1],
                             'center': (indices[0] + indices[-1]) / 2
                         })
+                
+                # 能量强度过滤 (剔除微弱误触)
+                if len(candidate_segments) > 0:
+                    segment_energies = []
+                    for seg in candidate_segments:
+                        seg_data = data_clean[seg['start']:seg['end']]
+                        rms = np.mean(np.sqrt(np.mean(seg_data**2, axis=0)))
+                        segment_energies.append(rms)
+                    median_energy = np.median(segment_energies)
+                    energy_threshold = median_energy * 5.0
+                    filtered_candidates = [seg for i, seg in enumerate(candidate_segments) if segment_energies[i] < energy_threshold]
+                    # ==========================================
+                    candidate_segments = filtered_candidates
+
+                # 节奏过滤 (VAD 模式下的 Rhythm Filter)
+                if ENABLE_RHYTHM and len(candidate_segments) > 1:
+                    expected_interval = EXPECTED_INTERVAL_MS * (FS / 1000)
+                    min_gap = expected_interval * INTERVAL_RATIO
+                    
+                    final_segments = []
+                    if candidate_segments:
+                        final_segments.append(candidate_segments[0])
+                        last_center = candidate_segments[0]['center']
+                        for i in range(1, len(candidate_segments)):
+                            curr_center = candidate_segments[i]['center']
+                            if (curr_center - last_center) > min_gap:
+                                final_segments.append(candidate_segments[i])
+                                last_center = curr_center
+                else:
+                    final_segments = candidate_segments
+
+            # ================= 共同切片逻辑 =================
             
-            if len(candidate_segments) > 0:
-                segment_energies = []
-                for seg in candidate_segments:
-                    # 使用 data_clean (多通道) 计算平均 RMS
-                    seg_data = data_clean[seg['start']:seg['end']]
-                    # 1. 算出每个通道的 RMS -> 2. 对所有通道取平均
-                    rms = np.mean(np.sqrt(np.mean(seg_data**2, axis=0)))
-                    segment_energies.append(rms)
-                
-                # 计算基准 (中位数)
-                median_energy = np.median(segment_energies)
-                # 设定倍率阈值 (通常 5.0 倍于中位数的视为异常)
-                energy_threshold = median_energy * 5.0
-                
-                filtered_candidates = []
-                for i, seg in enumerate(candidate_segments):
-                    if segment_energies[i] < energy_threshold:
-                        filtered_candidates.append(seg)
-                    # else: print(f"剔除高能异常: {segment_energies[i]:.2f} > {energy_threshold:.2f}")
-                
-                candidate_segments = filtered_candidates
-
-            # B. 节奏过滤 (Rhythm) - GUI: 启用 4s, 0.90
-            final_segments = []
-            if ENABLE_RHYTHM and len(candidate_segments) > 1:
-                # 使用固定 4秒 间隔
-                expected_interval = EXPECTED_INTERVAL_MS * (FS / 1000) # samples
-                min_gap = expected_interval * INTERVAL_RATIO
-                
-                final_segments.append(candidate_segments[0])
-                last_center = candidate_segments[0]['center']
-                
-                for i in range(1, len(candidate_segments)):
-                    curr_center = candidate_segments[i]['center']
-                    # 只有当距离上一个有效动作足够远时才保留
-                    if (curr_center - last_center) > min_gap:
-                        final_segments.append(candidate_segments[i])
-                        last_center = curr_center
-            else:
-                final_segments = candidate_segments
-
-            # --- 5. 切片与增强 ---
             action_samples_count = 0 
             
             for seg_idx, seg in enumerate(final_segments):
                 segment_data = data_clean[seg['start']:seg['end']]
                 
-                # Z-Score 归一化 (使用段内统计量)
+                # Z-Score 归一化
                 seg_mean = np.mean(segment_data, axis=0)
                 seg_std = np.std(segment_data, axis=0)
                 segment_norm = (segment_data - seg_mean) / (seg_std + 1e-6)
                 
                 # 滑动窗口切片
-                for w_start in range(0, len(segment_norm) - WINDOW_SIZE, current_stride_size):
+                # 注意：Peak 模式下，如果 segment 长度正好等于 peak_win_ms，且 stride 很小，可能只会产出几个切片
+                for w_start in range(0, len(segment_norm) - WINDOW_SIZE + 1, current_stride_size):
                     window = segment_norm[w_start : w_start + WINDOW_SIZE]
                     
                     # 原始样本
@@ -332,7 +448,7 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
                     groups_list.append(f"{f}_act_{seg_idx}")
                     action_samples_count += 1
                     
-                    # 增强样本 (Few-shot)
+                    # 增强样本
                     for _ in range(multiplier - 1):
                         aug_window = window.copy()
                         if enable_warp and np.random.random() > 0.3: aug_window = time_warp(aug_window)
@@ -345,33 +461,55 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
                         y_list.append(label)
                         groups_list.append(f"{f}_act_{seg_idx}_aug")
 
-            # --- 6. 提取静息样本 (Rest) ---
+            # --- 提取静息样本 (Rest) ---
             if enable_rest:  
-                # 注意：静息样本应从 mask 之外提取，mask 应该包含所有被视为"活动"的区域
-                # 为了安全，我们对原始 VAD 结果取反，而不是 refine 后的，以避免把剔除的噪音当成静息
-                rest_mask_base = ~raw_mask 
-                safe_margin = int(0.1 * FS)
+                # 不直接使用 ~raw_mask，而是重新计算严格的低能量区域
+                # 这样可以防止把节拍之间的噪音误当做 Rest 训练
+                
+                # 1. 重新计算一个宽泛的 VAD Mask (基于能量阈值)
+                # 注意：这里需要用到前面计算好的 energy_smooth
+                noise_floor = np.percentile(energy_smooth, 10)
+                peak_level = np.percentile(energy_smooth, 99)
+                
+                # 使用与 VAD 模式相同的阈值系数 (0.15)
+                vad_threshold = noise_floor + 0.15 * (peak_level - noise_floor)
+                vad_mask = energy_smooth > vad_threshold
+                
+                # 2. 对 VAD Mask 取反，得到真正的“安静区”
+                rest_mask_base = ~vad_mask 
+                
+                # 3. 腐蚀 (Erosion) 确保远离动作边缘
+                # 稍微加大安全距离 (150ms)，保证数据纯净
+                safe_margin = int(0.15 * FS)
                 rest_mask_base = ndimage.binary_erosion(rest_mask_base, structure=np.ones(safe_margin))
+                
                 labeled_rest, num_rest = ndimage.label(rest_mask_base)
                 
+                # 计算目标数量：保持与 GUI 逻辑兼容
+                # GUI 逻辑倾向于让 Rest 数量与动作数量平衡
                 target_rest_count = int(action_samples_count * multiplier * rest_ratio_per_file) 
                 if target_rest_count < 5: target_rest_count = 5
 
                 all_rest_windows = []
                 for i in range(1, num_rest + 1):
                     r_indices = np.where(labeled_rest == i)[0]
+                    # 长度检查
                     if len(r_indices) > WINDOW_SIZE:
                         r_seg_data = data_clean[r_indices[0]:r_indices[-1]]
+                        
+                        # Z-Score Norm
                         r_mean = np.mean(r_seg_data, axis=0)
                         r_std = np.std(r_seg_data, axis=0)
                         r_std = np.where(r_std < 0.01, 1.0, r_std) 
                         r_seg_norm = (r_seg_data - r_mean) / (r_std + 1e-6)
                         
-                        rest_stride = current_stride_size * 2
+                        # 较大的步长采样，避免静息数据过于重复
+                        rest_stride = WINDOW_SIZE 
                         for w_start in range(0, len(r_seg_norm) - WINDOW_SIZE, rest_stride):
                             all_rest_windows.append(r_seg_norm[w_start : w_start + WINDOW_SIZE])
 
                 if len(all_rest_windows) > 0:
+                    # 随机打乱并抽取
                     indices = np.arange(len(all_rest_windows))
                     np.random.shuffle(indices)
                     selected_indices = indices[:target_rest_count]
@@ -383,6 +521,8 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
 
         except Exception as e:
             print(f"Error processing {f}: {e}")
+            import traceback
+            traceback.print_exc()
             
     if len(X_list) == 0:
         return np.array([]), np.array([]), np.array([])
