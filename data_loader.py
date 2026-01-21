@@ -253,9 +253,6 @@ def scale_amplitude(data, scale_range=(0.8, 1.2)):
     factor = np.random.uniform(scale_range[0], scale_range[1])
     return data * factor
 
-# data_loader.py
-
-# ... (保留原有的 imports 和辅助函数, 如 parse_filename_info, refine_mask_logic 等) ...
 
 def process_selected_files(file_list, progress_callback=None, stride_ms=100, augment_config=None, segmentation_config=None):
     """

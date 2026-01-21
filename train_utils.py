@@ -314,6 +314,7 @@ def train_with_voting_mechanism(model, X_train, y_train, groups_train,
             wait = 0 # Loss 创新低，重置等待计数器
             # 可以在这里保存最佳权重 (ModelCheckpoint 逻辑)
         else:
+            wait += 1
             if wait >= patience:
                 new_lr = max(current_lr * factor, min_lr)
                 if current_lr > new_lr: 
