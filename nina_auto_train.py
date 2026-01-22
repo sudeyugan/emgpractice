@@ -13,7 +13,7 @@ import gc
 
 # 引用现有模块
 import train_utils
-import model as model_lib  # 避免变量名冲突
+import nina_model as model_lib  # 避免变量名冲突
 
 # ==================== 0. 配置区域 (根据需求修改) ====================
 
