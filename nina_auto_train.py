@@ -23,10 +23,7 @@ TARGET_LABELS = [1, 2, 5, 6]                       # 只取这4个动作
 
 # 2. 实验变量 (Grid Search)
 MODELS_TO_TEST = [
-    ("Simple_CNN", model_lib.build_simple_cnn),
-    ("Advanced_CRNN", model_lib.build_advanced_crnn),
     ("TCN", model_lib.build_tcn_model),
-    ("ResNet1D", model_lib.build_resnet_model),
 ]
 
 OPTIMIZERS_TO_TEST = [
@@ -35,16 +32,15 @@ OPTIMIZERS_TO_TEST = [
     ("Nadam", tf.keras.optimizers.Nadam, 0.001, {}),
 ]
 
-VOTING_OPTIONS = [False, True] # 是否开启投票
+VOTING_OPTIONS = [False] # 是否开启投票
 
 # 3. 固定参数
 CONFIG = {
     'fs': 100, 
     'epochs': 100,
     'batch_size': 256,
-    'stride_ms': 50,           # 切片步长 50ms
     'test_size': 0.2,          # 测试集比例
-    'split_strategy': "混合切分 (看到所有天/人)", 
+    'split_strategy': "留文件验证 (同天/同人)",
     'label_smoothing': 0.1,    # 标签平滑
     'voting_start_epoch': 20,  # 投票开启时间
     'voting_weight': 0.5,      # 投票权重
@@ -268,7 +264,7 @@ def run_automation():
     
     input_shape = (X.shape[1], X.shape[2])
 
-    MODELS_DIR = "trained_models"  # [NEW]
+    MODELS_DIR = "nina_trained_models"  
     if not os.path.exists(MODELS_DIR):
         os.makedirs(MODELS_DIR)
     
