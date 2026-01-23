@@ -18,12 +18,15 @@ import nina_model as model_lib  # 避免变量名冲突
 # ==================== 0. 配置区域 (根据需求修改) ====================
 
 # 1. 目标设置
-TARGET_SUBJECTS = [f"s{i}" for i in range(1, 22)]  # s1 ... s21
-TARGET_LABELS = [1, 2, 5, 6]                       # 只取这4个动作                
+TARGET_SUBJECTS = [f"s{i}" for i in range(1, 25)]  
+TARGET_LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]                       # 只取这8个动作
 
 # 2. 实验变量 (Grid Search)
 MODELS_TO_TEST = [
+    ("Simple_CNN", model_lib.build_simple_cnn),
+    ("Advanced_CRNN", model_lib.build_advanced_crnn),
     ("TCN", model_lib.build_tcn_model),
+    ("ResNet1D", model_lib.build_resnet_model),
 ]
 
 OPTIMIZERS_TO_TEST = [
@@ -58,7 +61,7 @@ AUGMENT_CONFIG = {
     'enable_mask': False
 }
 
-LOG_DIR = "auto_train_logs"
+LOG_DIR = "E1_auto_train_logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
@@ -83,11 +86,11 @@ def process_mat_files(data_root="data"):
     groups_list = []
     
     # 1. 遍历 s1 到 s25
-    for subject_id in range(1, 26):
+    for subject_id in range(1, 25):
         subject_name = f"s{subject_id}"
-        # 寻找对应的 E2 文件: data/s1/S1_A1_E2.mat
+        # 寻找对应的 E1 文件: data/s1/S1_A1_E1.mat
         folder_path = os.path.join(data_root, subject_name)
-        mat_file = os.path.join(folder_path, f"S{subject_id}_A1_E2.mat")
+        mat_file = os.path.join(folder_path, f"S{subject_id}_A1_E1.mat")
         
         if not os.path.exists(mat_file):
             print(f"⚠️ 跳过: 找不到 {mat_file}")
@@ -264,7 +267,7 @@ def run_automation():
     
     input_shape = (X.shape[1], X.shape[2])
 
-    MODELS_DIR = "nina_trained_models"  
+    MODELS_DIR = "E1_nina_trained_models"  
     if not os.path.exists(MODELS_DIR):
         os.makedirs(MODELS_DIR)
     

@@ -11,6 +11,7 @@ import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
 import datetime
 import train_utils
+import data_loader  # [NEW] 引入数据增强工具库
 
 
 # ================= 0. 配置与工具函数 =================
@@ -30,6 +31,62 @@ if 'trained_model' not in st.session_state:
     st.session_state['trained_model'] = None
 if 'train_history' not in st.session_state:
     st.session_state['train_history'] = None
+
+# [NEW] 数据集增强函数 (Post-Split Augmentation)
+def augment_dataset(X, y, groups, config, progress_bar=None):
+    """
+    对训练集进行内存内增强
+    """
+    multiplier = config.get('multiplier', 1)
+    if multiplier <= 1:
+        return X, y, groups
+    
+    X_aug, y_aug, groups_aug = [], [], []
+    total = len(X)
+    
+    # 提取配置
+    enable_warp = config.get('enable_warp', False)
+    enable_shift = config.get('enable_shift', False)
+    enable_scale = config.get('enable_scaling', False)
+    enable_mask = config.get('enable_mask', False)
+    enable_noise = config.get('enable_noise', False)
+    
+    for i in range(total):
+        # 1. 加入原始样本
+        X_aug.append(X[i])
+        y_aug.append(y[i])
+        groups_aug.append(groups[i])
+        
+        # 2. 生成增强样本
+        for _ in range(multiplier - 1):
+            aug_x = X[i].copy()
+            
+            # 按概率应用各种增强
+            if enable_warp and np.random.random() > 0.5:
+                aug_x = data_loader.time_warp(aug_x)
+            
+            if enable_shift and np.random.random() > 0.5:
+                aug_x = data_loader.time_shift(aug_x)
+                
+            if enable_scale and np.random.random() > 0.3:
+                aug_x = data_loader.scale_amplitude(aug_x)
+                
+            if enable_mask and np.random.random() > 0.7:
+                aug_x = data_loader.channel_mask(aug_x)
+                
+            if enable_noise: # 噪声通常最后加
+                aug_x = data_loader.add_noise(aug_x)
+            
+            X_aug.append(aug_x)
+            y_aug.append(y[i])
+            groups_aug.append(f"{groups[i]}_aug")
+            
+        if progress_bar and i % 10 == 0:
+            progress_bar.progress(i / total)
+            
+    if progress_bar: progress_bar.progress(1.0)
+    
+    return np.array(X_aug, dtype=np.float32), np.array(y_aug), np.array(groups_aug)
 
 # ================= 1. 核心：移植自 nina_auto_train.py 的数据处理 =================
 def process_nina_data(data_root, selected_subjects, target_labels, 
@@ -54,9 +111,8 @@ def process_nina_data(data_root, selected_subjects, target_labels,
         
         # 增强的文件名搜索
         possible_filenames = [
-            f"{subj_upper}_A1_E2.mat",   # S1_A1_E2.mat
-            f"{subject_name}_A1_E2.mat", # s1_A1_E2.mat
-            f"{subj_upper}_E2_A1.mat"    # S1_E2_A1.mat
+            f"{subj_upper}_A1_E1.mat",   # S1_A1_E1.mat
+            f"{subject_name}_A1_E1.mat", # s1_A1_E1.mat
         ]
         
         mat_file = None
@@ -127,11 +183,6 @@ def process_nina_data(data_root, selected_subjects, target_labels,
                     subj_act_groups.append(f"{subject_name}_act_{i}")
 
             # --- B. 提取静息样本 (Rest) 
-            if 0 in target_labels or (0 in [0]): # 强制检查是否需要提取 Rest，通常用户虽然没选0但代码逻辑可能需要
-                # 检查用户是否显式选择了 Label 0，或者我们作为默认增强策略添加
-                # 这里假设只要 target_labels 里有 0 就提取
-                pass
-            
             if 0 in target_labels:
                 # 1. 膨胀动作区域 (作为 Buffer)，避开动作边缘
                 buffer_size = 100
@@ -169,15 +220,13 @@ def process_nina_data(data_root, selected_subjects, target_labels,
 
                 # 2. 计算合适的静息数量 (1:1 平衡策略)
                 if len(subj_rest_X) > 0:
-                    # 策略：让静息总数 ≈ 单个动作类别的平均数量
-                    # 这样静息类不会因为在这个受试者身上时间很长而由于数据量过大主导 Loss
                     unique_act_classes = np.unique(subj_act_y)
                     num_act_classes_found = len(unique_act_classes)
                     
                     if num_act_classes_found > 0:
                         target_rest_count = int(len(subj_act_X) / num_act_classes_found)
                     else:
-                        target_rest_count = len(subj_rest_X) # 全是静息的情况
+                        target_rest_count = len(subj_rest_X) 
                     
                     # 3. 随机采样
                     if len(subj_rest_X) > target_rest_count and target_rest_count > 0:
@@ -187,12 +236,10 @@ def process_nina_data(data_root, selected_subjects, target_labels,
                             y_list.append(subj_rest_y[s_idx])
                             groups_list.append(subj_rest_groups[s_idx])
                     else:
-                        # 不够或者刚好，就全都要
                         X_list.extend(subj_rest_X)
                         y_list.extend(subj_rest_y)
                         groups_list.extend(subj_rest_groups)
             elif len(subj_rest_X) > 0:
-                # 只有静息数据的情况
                 X_list.extend(subj_rest_X)
                 y_list.extend(subj_rest_y)
                 groups_list.extend(subj_rest_groups)
@@ -214,13 +261,10 @@ base_model_file = st.sidebar.file_uploader(
 
 # --- B. 数据源 ---
 st.sidebar.header("2. 数据源 (NinaPro Data)")
-# 让用户输入数据根目录，不再扫描 CSV
 data_root_input = st.sidebar.text_input("数据根目录 (包含 s1, s2...)", value="data")
 
-# 手动输入或扫描 Subject
 all_subjects = []
 if os.path.exists(data_root_input):
-    # 简单的扫描：查找 s1, s2... 文件夹
     try:
         items = os.listdir(data_root_input)
         all_subjects = sorted([d for d in items if os.path.isdir(os.path.join(data_root_input, d)) and d.startswith('s')])
@@ -229,15 +273,12 @@ if os.path.exists(data_root_input):
 
 if not all_subjects:
     st.sidebar.warning("未检测到 's*' 文件夹，请手动检查路径")
-    # 允许手动输入 fallback
     manual_subjs = st.sidebar.text_input("或手动输入 Subject (逗号分隔)", "s1, s2")
     if manual_subjs:
         selected_subjects = [s.strip() for s in manual_subjs.split(',')]
 else:
     selected_subjects = st.sidebar.multiselect("选择 Subject 进行微调", all_subjects, default=all_subjects[:1])
 
-# 选择 Labels
-# nina_auto_train 默认是 [1, 2, 5, 6]，这里允许用户改
 target_labels_str = st.sidebar.text_input("目标动作 ID (逗号分隔)", "1, 2, 5, 6")
 try:
     target_labels = [int(x.strip()) for x in target_labels_str.split(',') if x.strip()]
@@ -255,11 +296,32 @@ batch_size = st.sidebar.selectbox("Batch Size", [16, 32, 64, 128], index=1)
 lr = st.sidebar.number_input("Learning Rate", value=0.001, format="%.5f")
 num_shots = st.sidebar.slider("每类样本数 (Few-shot用)", 1, 10, 2) if not unfreeze_all else 9999
 
+# [NEW] 数据增强配置
+with st.sidebar.expander("🧪 数据增强 (Data Augmentation)", expanded=False):
+    st.caption("小样本(Few-shot)训练时建议开启")
+    aug_multiplier = st.slider("样本倍增系数 (Multiplier)", 1, 20, 1, help="将训练集扩大N倍")
+    
+    c1, c2 = st.columns(2)
+    enable_noise = c1.checkbox("高斯噪声", True)
+    enable_scale = c2.checkbox("幅度缩放", True)
+    enable_warp = c1.checkbox("时间扭曲", False, help="计算量较大")
+    enable_shift = c2.checkbox("时间平移", False)
+    enable_mask = st.checkbox("通道遮挡", False)
+
+    augment_config = {
+        'multiplier': aug_multiplier,
+        'enable_noise': enable_noise,
+        'enable_scaling': enable_scale,
+        'enable_warp': enable_warp,
+        'enable_shift': enable_shift,
+        'enable_mask': enable_mask
+    }
+
 run_btn = st.sidebar.button("🚀 开始微调", type="primary")
 
 # ================= 3. 主界面逻辑 =================
 st.title("🧠 NinaPro 模型微调 (MAT版)")
-st.caption("基于 nina_auto_train.py 核心逻辑")
+st.caption("基于 nina_auto_train.py 核心逻辑 + Few-shot 数据增强")
 
 if run_btn:
     if not base_model_file:
@@ -287,27 +349,22 @@ if run_btn:
         st.stop()
         
     X = X.astype(np.float32)
-    # 标签重映射 (例如把 1,2,5,6 -> 0,1,2,3)
+    # 标签重映射
     unique_labels = np.unique(y)
     label_map = {original: new for new, original in enumerate(unique_labels)}
     y_mapped = np.array([label_map[i] for i in y])
     num_classes = len(unique_labels)
     
-    st.success(f"✅ 数据加载成功: X={X.shape}, y={y.shape} | 包含动作: {unique_labels}")
+    st.success(f"✅ 原始数据加载成功: X={X.shape}, y={y.shape} | 包含动作: {unique_labels}")
     
     # --- Step 2: 划分数据集 ---
     if unfreeze_all:
-        # 全量微调：使用留文件验证 (如果有多个文件) 或 简单切分
-        # 这里因为 nina_auto_train 通常每个 subject 只有一个文件 (E2)，
-        # 如果只选了一个 subject，只能随机切分；选了多个可以留一个做验证。
         if len(selected_subjects) > 1:
-            # 简单策略：留最后一个 subject 做验证
             test_mask = np.char.startswith(groups, selected_subjects[-1])
             train_idx = np.where(~test_mask)[0]
             test_idx = np.where(test_mask)[0]
             st.info(f"验证策略: 使用 {selected_subjects[-1]} 作为验证集")
         else:
-            # 只有一个 subject，只能随机切
             from sklearn.model_selection import train_test_split
             idx = np.arange(len(X))
             train_idx, test_idx = train_test_split(idx, test_size=0.2, random_state=42, stratify=y_mapped)
@@ -319,11 +376,22 @@ if run_btn:
         
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y_mapped[train_idx], y_mapped[test_idx]
+    groups_train = groups[train_idx]
+
+    # --- [NEW] Step 2.5: 数据增强 (仅针对训练集) ---
+    if augment_config['multiplier'] > 1:
+        st.subheader("2. 执行数据增强")
+        aug_bar = st.progress(0)
+        st.info(f"正在将训练集扩大 {augment_config['multiplier']} 倍 (应用: 噪声={enable_noise}, 扭曲={enable_warp}...)")
+        
+        X_train, y_train, groups_train = augment_dataset(
+            X_train, y_train, groups_train, augment_config, progress_bar=aug_bar
+        )
+        st.success(f"📈 增强后训练集规模: {X_train.shape}")
     
     # --- Step 3: 加载与适配模型 ---
-    st.subheader("2. 模型适配")
+    st.subheader("3. 模型适配")
     
-    # 保存临时文件
     temp_path = f"temp_{base_model_file.name}"
     with open(temp_path, "wb") as f: f.write(base_model_file.getbuffer())
     
@@ -333,7 +401,6 @@ if run_btn:
         st.error(f"模型加载失败: {e}")
         st.stop()
         
-    # 检查维度
     if base_model.input_shape[-1] != X.shape[-1]:
         st.error(f"❌ 维度不匹配: 模型输入通道 {base_model.input_shape[-1]} vs 数据通道 {X.shape[-1]}")
         st.stop()
@@ -347,13 +414,11 @@ if run_btn:
             model = base_model
         else:
             st.warning(f"重置分类头: {old_classes} -> {num_classes} 类")
-            # 剥离旧头 (取倒数第二层)
             feature_out = base_model.layers[-2].output
             new_out = tf.keras.layers.Dense(num_classes, activation='softmax')(feature_out)
             model = tf.keras.models.Model(base_model.input, new_out)
     else:
-        base_model.trainable = False # 冻结
-        # 寻找特征层 (简单启发式：找 GlobalAvgPool 或 Flatten)
+        base_model.trainable = False 
         feature_layer = None
         for layer in reversed(base_model.layers):
             if "global" in layer.name or "flatten" in layer.name:
@@ -362,7 +427,6 @@ if run_btn:
         
         feat_out = feature_layer.output if feature_layer else base_model.layers[-2].output
         
-        # 加新的分类头
         x = tf.keras.layers.Dropout(0.5)(feat_out)
         x = tf.keras.layers.Dense(64, activation='relu')(x)
         outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
@@ -375,7 +439,7 @@ if run_btn:
     )
     
     # --- Step 4: 训练 ---
-    st.subheader("3. 开始训练")
+    st.subheader("4. 开始训练")
     t_prog = st.progress(0)
     t_status = st.empty()
     st_cb = train_utils.StreamlitKerasCallback(epochs, t_prog, t_status)
@@ -390,7 +454,7 @@ if run_btn:
     )
     
     # --- Step 5: 结果 ---
-    st.subheader("4. 评估报告")
+    st.subheader("5. 评估报告")
     final_acc = history.history['val_accuracy'][-1]
     st.metric("最终验证集准确率", f"{final_acc:.2%}")
     
