@@ -362,12 +362,18 @@ if run_btn:
         st.error(f"未提取到任何样本！请检查 {data_root_input} 下是否有 .mat 文件，以及 Label 是否存在。")
         st.stop()
         
+    if len(X) == 0:
+        st.error(f"未提取到任何样本！请检查 {data_root_input} 下是否有 .mat 文件，以及 Label 是否存在。")
+        st.stop()
+        
     X = X.astype(np.float32)
-    # 标签重映射
+    
     unique_labels = np.unique(y)
-    label_map = {original: new for new, original in enumerate(unique_labels)}
-    y_mapped = np.array([label_map[i] for i in y])
-    num_classes = len(unique_labels)
+    y_mapped = y.astype(int)  # 直接使用原始值
+    
+    label_map = {val: val for val in unique_labels} 
+
+    num_classes = int(np.max(y_mapped)) + 1
     
     st.success(f"✅ 原始数据加载成功: X={X.shape}, y={y.shape} | 包含动作: {unique_labels}")
     
@@ -432,6 +438,10 @@ if run_btn:
         st.stop()
         
     old_classes = base_model.output_shape[-1]
+    
+    if old_classes >= num_classes:
+        num_classes = old_classes
+        # st.info(f"已对齐基模型输出维度: {num_classes} 类")
     
     # [MODIFIED] 改造模型逻辑
     if is_inference_only:
