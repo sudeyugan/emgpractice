@@ -288,13 +288,27 @@ except:
 
 # --- C. 微调参数 ---
 st.sidebar.header("3. 训练参数")
-fine_tune_mode = st.sidebar.radio("微调模式", ["Few-shot (冻结特征)", "Full Fine-tune (全量微调)"], index=0)
+# [MODIFIED] 增加 "直接评估 (Inference Only)" 选项
+fine_tune_mode = st.sidebar.radio(
+    "模式选择", 
+    ["Few-shot (冻结特征)", "Full Fine-tune (全量微调)", "直接评估 (Inference Only)"], 
+    index=0
+)
+
+# 仅在非直接评估模式下显示这些参数
+is_inference_only = (fine_tune_mode == "直接评估 (Inference Only)")
 unfreeze_all = (fine_tune_mode == "Full Fine-tune (全量微调)")
 
-epochs = st.sidebar.number_input("Epochs", 10, 200, 30)
-batch_size = st.sidebar.selectbox("Batch Size", [16, 32, 64, 128], index=1)
-lr = st.sidebar.number_input("Learning Rate", value=0.001, format="%.5f")
-num_shots = st.sidebar.slider("每类样本数 (Few-shot用)", 1, 10, 2) if not unfreeze_all else 9999
+if not is_inference_only:
+    epochs = st.sidebar.number_input("Epochs", 10, 200, 30)
+    batch_size = st.sidebar.selectbox("Batch Size", [16, 32, 64, 128], index=1)
+    lr = st.sidebar.number_input("Learning Rate", value=0.001, format="%.5f")
+    num_shots = st.sidebar.slider("每类样本数 (Few-shot用)", 1, 10, 2) if not unfreeze_all else 9999
+else:
+    # 推理模式下只需少许参数
+    batch_size = 32
+    epochs = 0
+    st.sidebar.info("ℹ️ 直接评估模式：跳过训练，直接使用基模型预测所选数据。请确保所选动作标签的顺序与模型训练时一致。")
 
 # [NEW] 数据增强配置
 with st.sidebar.expander("🧪 数据增强 (Data Augmentation)", expanded=False):
@@ -358,7 +372,18 @@ if run_btn:
     st.success(f"✅ 原始数据加载成功: X={X.shape}, y={y.shape} | 包含动作: {unique_labels}")
     
     # --- Step 2: 划分数据集 ---
-    if unfreeze_all:
+    if is_inference_only:
+        # [NEW] 直接评估模式：所有数据都是测试集
+        st.info("模式: 直接评估 (Inference Only) - 所有加载的数据将直接用于测试，不进行训练。")
+        X_train = np.array([]) # 空数组
+        y_train = np.array([])
+        groups_train = np.array([])
+        
+        X_test = X
+        y_test = y_mapped
+        groups_test = groups # 假设 groups 也有用
+        
+    elif unfreeze_all:
         if len(selected_subjects) > 1:
             test_mask = np.char.startswith(groups, selected_subjects[-1])
             train_idx = np.where(~test_mask)[0]
@@ -374,12 +399,13 @@ if run_btn:
         train_idx, test_idx = train_utils.get_few_shot_split(X, y_mapped, num_shots)
         st.info(f"验证策略: Few-shot (每类 {num_shots} 个训练样本)")
         
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y_mapped[train_idx], y_mapped[test_idx]
-    groups_train = groups[train_idx]
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y_mapped[train_idx], y_mapped[test_idx]
+        groups_train = groups[train_idx]
 
     # --- [NEW] Step 2.5: 数据增强 (仅针对训练集) ---
-    if augment_config['multiplier'] > 1:
+    # [MODIFIED] 只有在非推理模式且开启增强时才执行
+    if not is_inference_only and augment_config['multiplier'] > 1:
         st.subheader("2. 执行数据增强")
         aug_bar = st.progress(0)
         st.info(f"正在将训练集扩大 {augment_config['multiplier']} 倍 (应用: 噪声={enable_noise}, 扭曲={enable_warp}...)")
@@ -390,7 +416,7 @@ if run_btn:
         st.success(f"📈 增强后训练集规模: {X_train.shape}")
     
     # --- Step 3: 加载与适配模型 ---
-    st.subheader("3. 模型适配")
+    st.subheader("3. 模型准备")
     
     temp_path = f"temp_{base_model_file.name}"
     with open(temp_path, "wb") as f: f.write(base_model_file.getbuffer())
@@ -407,8 +433,16 @@ if run_btn:
         
     old_classes = base_model.output_shape[-1]
     
-    # 改造模型
-    if unfreeze_all:
+    # [MODIFIED] 改造模型逻辑
+    if is_inference_only:
+        # 推理模式：直接使用原模型
+        if old_classes != num_classes:
+            st.warning(f"⚠️ 警告: 模型输出类别数 ({old_classes}) 与当前数据类别数 ({num_classes}) 不一致！混淆矩阵可能无法正确对应。")
+        model = base_model
+        # 即使不训练，compile 也是为了后续 evaluate 能计算 loss/accuracy
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        
+    elif unfreeze_all:
         base_model.trainable = True
         if old_classes == num_classes:
             model = base_model
@@ -432,31 +466,48 @@ if run_btn:
         outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
         model = tf.keras.models.Model(base_model.input, outputs)
         
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
     
     # --- Step 4: 训练 ---
-    st.subheader("4. 开始训练")
-    t_prog = st.progress(0)
-    t_status = st.empty()
-    st_cb = train_utils.StreamlitKerasCallback(epochs, t_prog, t_status)
-    
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_test, y_test),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[st_cb],
-        verbose=0
-    )
+    # [MODIFIED] 仅在非推理模式下训练
+    if not is_inference_only:
+        st.subheader("4. 开始训练")
+        t_prog = st.progress(0)
+        t_status = st.empty()
+        st_cb = train_utils.StreamlitKerasCallback(epochs, t_prog, t_status)
+        
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_test, y_test),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=[st_cb],
+            verbose=0
+        )
+        # 为了后面画图不报错，构造一个假的 history 对象给推理模式用
+    else:
+        st.subheader("4. 直接评估 (跳过训练)")
+        st.write("正在使用基模型对数据进行预测...")
+        # 为了代码兼容性，手动创建一个类似 history 的结构
+        class MockHistory:
+            def __init__(self): self.history = {'loss': [], 'val_loss': [], 'accuracy': [], 'val_accuracy': []}
+        history = MockHistory()
+
     
     # --- Step 5: 结果 ---
     st.subheader("5. 评估报告")
-    final_acc = history.history['val_accuracy'][-1]
-    st.metric("最终验证集准确率", f"{final_acc:.2%}")
+    
+    # [MODIFIED] 获取评估结果
+    if is_inference_only:
+        loss, final_acc = model.evaluate(X_test, y_test, verbose=0)
+    else:
+        final_acc = history.history['val_accuracy'][-1]
+        
+    st.metric("测试集准确率", f"{final_acc:.2%}")
     
     # 混淆矩阵
     y_pred = np.argmax(model.predict(X_test, verbose=0), axis=1)
@@ -464,12 +515,17 @@ if run_btn:
     
     c1, c2 = st.columns(2)
     with c1:
-        fig, ax = plt.subplots()
-        ax.plot(history.history['loss'], label='Train')
-        ax.plot(history.history['val_loss'], label='Val')
-        ax.legend()
-        ax.set_title("Loss Curve")
-        st.pyplot(fig)
+        if not is_inference_only:
+            # 只有训练过才有曲线
+            fig, ax = plt.subplots()
+            ax.plot(history.history['loss'], label='Train')
+            ax.plot(history.history['val_loss'], label='Val')
+            ax.legend()
+            ax.set_title("Loss Curve")
+            st.pyplot(fig)
+        else:
+            st.info("直接评估模式无训练曲线")
+            
     with c2:
         fig2, ax2 = plt.subplots()
         names = [str(k) for k in label_map.keys()]
