@@ -18,8 +18,8 @@ import nina_model as model_lib  # 避免变量名冲突
 # ==================== 0. 配置区域 (根据需求修改) ====================
 
 # 1. 目标设置
-TARGET_SUBJECTS = [f"s{i}" for i in range(1, 25)]  
-TARGET_LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]                       # 只取这8个动作
+TARGET_SUBJECTS = [f"s{i}" for i in range(1, 39)]  
+TARGET_LABELS = [1, 2, 3, 4, 5, 6, 7, 8]                       # 只取这8个动作
 
 # 2. 实验变量 (Grid Search)
 MODELS_TO_TEST = [
@@ -39,7 +39,7 @@ VOTING_OPTIONS = [False] # 是否开启投票
 
 # 3. 固定参数
 CONFIG = {
-    'fs': 100, 
+    'fs': 2000,                # 采样率                  
     'epochs': 100,
     'batch_size': 256,
     'test_size': 0.2,          # 测试集比例
@@ -80,13 +80,13 @@ class MockStatusText:
 
 # ==================== 2. 数据加载函数 ====================
 
-def process_mat_files(data_root="data"):
+def process_mat_files(data_root="data40"):
     X_list = []
     y_list = []
     groups_list = []
     
-    # 1. 遍历 s1 到 s25
-    for subject_id in range(1, 25):
+    # 1. 遍历 s1 到 s38
+    for subject_id in range(1, 39):
         subject_name = f"s{subject_id}"
         # 寻找对应的 E1 文件: data/s1/S1_A1_E1.mat
         folder_path = os.path.join(data_root, subject_name)
@@ -105,7 +105,7 @@ def process_mat_files(data_root="data"):
             # 1. 获取 EMG 数据 (取前8列，并做特定的归一化)
             # 假设 emg 变量名就是 'emg'
             raw_emg = mat_data['emg'][:, :8] 
-            emg_data = (raw_emg / 0.0024) - 1
+            emg_data = raw_emg
             
             # 2. 获取标签 (restimulus)
             # 也就是第 12 列 (如果从1开始数)，matlab里叫 restimulus
@@ -145,8 +145,8 @@ def process_mat_files(data_root="data"):
                 center_idx = int((indices[0] + indices[-1]) / 2)
                 
                 # 上下各取 150 (范围：center-150 到 center+150)
-                start_win = center_idx - 150
-                end_win = center_idx + 150
+                start_win = center_idx - 150*20
+                end_win = center_idx + 150*20
                 
                 # 边界检查
                 if start_win < 0 or end_win > len(emg_data):
@@ -166,7 +166,7 @@ def process_mat_files(data_root="data"):
             
             # 1. 膨胀动作区域 (作为 Buffer)
             # 比如我们要避开动作前后 100 行 (1秒)
-            buffer_size = 100
+            buffer_size = 100*20
             mask_active = stimulus > 0
             # 膨胀：让动作区变大，这样非动作区(静息)就变小了，相当于做了 Erosion
             mask_forbidden = ndimage.binary_dilation(mask_active, structure=np.ones(buffer_size))
@@ -181,14 +181,14 @@ def process_mat_files(data_root="data"):
                 r_indices = np.where(labeled_rest == i)[0]
                 
                 # 如果这段静息太短 (小于 300)，就跳过
-                if len(r_indices) < 300: continue
+                if len(r_indices) < 300*20: continue
                 
                 # 在这段里切片，比如取中间，或者每隔 300 点切一个
                 # 这里演示：只取这段静息的最中间一段
                 center_idx = int((r_indices[0] + r_indices[-1]) / 2)
-                start_win = center_idx - 150
-                end_win = center_idx + 150
-                
+                start_win = center_idx - 150*20
+                end_win = center_idx + 150*20
+
                 window = emg_data[start_win:end_win]
                 
                 subj_rest_X.append(window)
@@ -267,7 +267,7 @@ def run_automation():
     
     input_shape = (X.shape[1], X.shape[2])
 
-    MODELS_DIR = "E1_nina_trained_models"  
+    MODELS_DIR = "40_E1_nina_trained_models"  
     if not os.path.exists(MODELS_DIR):
         os.makedirs(MODELS_DIR)
     

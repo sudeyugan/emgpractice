@@ -117,6 +117,16 @@ def refine_mask_logic(mask, fs, energy=None):
         else:
             new_mask[loc] = True
             
+    samples_4s = int(4.0 * fs)
+    total_len = len(mask)
+    
+    for start in range(0, total_len, samples_4s):
+        end = min(start + samples_4s, total_len)
+        # 只要该窗口内有一点点噪音禁区 (noise_ban_mask 为 True)
+        if np.any(noise_ban_mask[start:end]):
+            # 就把整个 4s 窗口都封锁
+            noise_ban_mask[start:end] = True
+            
     # 2. 最终过滤：应用噪音屏蔽罩
     # 任何落在“禁区”内的有效信号（new_mask 为 True 的点），如果 noise_ban_mask 也是 True，就被强制置为 False
     # 也就是：new_mask = new_mask AND (NOT noise_ban_mask)
