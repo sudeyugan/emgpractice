@@ -197,11 +197,11 @@ def refine_mask_logic(mask, fs, energy=None):
                         new_mask[sub_loc] = True
             
         # --- B. 处理中等片段 (被丢弃) ---
-        elif 1000 < duration_ms <= 5000:
+        elif 2000 < duration_ms <= 5000:
             continue
 
-        # --- C. 处理短片段 (500ms ~ 1s) -> 取中间 ---
-        elif 500 < duration_ms <= 1000:
+        # --- C. 处理短片段 (500ms ~ 2s) -> 取中间 ---
+        elif 500 < duration_ms <= 2000:
             center = int(np.mean(loc))
             half = samples_500ms // 2
             start = max(0, center - half)
@@ -211,10 +211,7 @@ def refine_mask_logic(mask, fs, energy=None):
         # --- D. 处理极短片段 (<= 500ms) -> 保留 ---
         else:
             new_mask[loc] = True
-            
-    # 2. 最终过滤：应用噪音屏蔽罩
-    # 任何落在“禁区”内的有效信号（new_mask 为 True 的点），如果 noise_ban_mask 也是 True，就被强制置为 False
-    # 也就是：new_mask = new_mask AND (NOT noise_ban_mask)
+
     new_mask[noise_ban_mask] = False
     
     return new_mask

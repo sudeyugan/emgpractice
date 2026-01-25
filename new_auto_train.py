@@ -45,26 +45,23 @@ def channel_mask(data, mask_prob=0.15):
 
 # 1. 目标设置
 TARGET_SUBJECTS = ["charles", "gavvin", "gerard", "giland", "jessie", "legend"] 
-TARGET_LABELS = [5, 6, 7, 8]            # 指定动作标签
+TARGET_LABELS = [1, 3, 4, 5, 6, 7, 8, 9, 15]            # 指定动作标签
 TARGET_DATES = None                     # None 表示所有日期
 
 # 2. 实验模型 (Grid Search)
 MODELS_TO_TEST = [
-    ("Simple_CNN", model_lib.build_simple_cnn),
     ("Advanced_CRNN", model_lib.build_advanced_crnn),
     ("TCN", model_lib.build_tcn_model),
     ("ResNet1D", model_lib.build_resnet_model),
-    ("Dual_Stream", model_lib.build_dual_stream_model),
 ]
 
 OPTIMIZERS_TO_TEST = [
     ("Adam", tf.keras.optimizers.Adam, 0.001, {}),
     ("AdamW", tf.keras.optimizers.AdamW, 0.001, {'weight_decay': 1e-4}),
     ("Nadam", tf.keras.optimizers.Nadam, 0.001, {}),
-    ("SGD", tf.keras.optimizers.SGD, 0.01, {'momentum': 0.9}),
 ]
 
-VOTING_OPTIONS = [False, True] # 是否开启投票
+VOTING_OPTIONS = [False] # 是否开启投票
 
 # 3. 核心参数 (Rhythm Logic)
 CONFIG = {
@@ -90,7 +87,7 @@ AUGMENT_CONFIG = {
     'enable_mask': False
 }
 
-LOG_DIR = "auto_train_logs_rhythm"
+LOG_DIR = "1.24_9_auto_train_logs_rhythm"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
@@ -401,7 +398,7 @@ def run_automation():
     print(f"   Label Map: {label_map}")
 
     # 4. 训练循环
-    MODELS_DIR = "trained_models_rhythm"
+    MODELS_DIR = "1.24_9_trained_models_rhythm"
     if not os.path.exists(MODELS_DIR): os.makedirs(MODELS_DIR)
     
     total_exp = len(MODELS_TO_TEST) * len(OPTIMIZERS_TO_TEST) * len(VOTING_OPTIONS)

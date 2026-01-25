@@ -22,18 +22,17 @@ TARGET_DATES = None                     # None 表示所有日期，或者写 ["
 
 # 2. 实验变量 (Grid Search)
 MODELS_TO_TEST = [
-    # 格式: (模型名称, 构建函数)
-    ("Dual_Stream", model_lib.build_dual_stream_model)
+    ("TCN", model_lib.build_tcn_model),
 ]
 
 OPTIMIZERS_TO_TEST = [
     # 格式: (名称, 类/函数, 学习率, 其他参数)
     ("Adam", tf.keras.optimizers.Adam, 0.001, {}),
     ("AdamW", tf.keras.optimizers.AdamW, 0.001, {'weight_decay': 1e-4}),
-    ("SGD", tf.keras.optimizers.SGD, 0.01, {'momentum': 0.9}),
+    ("Nadam", tf.keras.optimizers.Nadam, 0.001, {}),
 ]
 
-VOTING_OPTIONS = [False, True] # 是否开启投票
+VOTING_OPTIONS = [False] # 是否开启投票
 
 # 3. 固定参数
 CONFIG = {
@@ -59,7 +58,7 @@ AUGMENT_CONFIG = {
     'enable_mask': False
 }
 
-LOG_DIR = "auto_train_logs"
+LOG_DIR = "1.24_9_auto_train_logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
@@ -143,7 +142,7 @@ def run_automation():
     
     input_shape = (X.shape[1], X.shape[2])
 
-    MODELS_DIR = "trained_models"  # [NEW]
+    MODELS_DIR = "1.24_9_trained_models"  # [NEW]
     if not os.path.exists(MODELS_DIR):
         os.makedirs(MODELS_DIR)
     

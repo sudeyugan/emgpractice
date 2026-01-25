@@ -129,7 +129,7 @@ with st.sidebar:
             seg_config['peak_win_ms'] = seg_win
     
     with st.expander("数据增强与采样", expanded=False):
-        train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 200, 100)
+        train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 200, 100, step=10)
         st.caption("负样本策略")
         enable_rest = st.checkbox("加入静息类 (Rest, Label 0)", value=True)
         st.caption("增强策略")
@@ -457,7 +457,6 @@ if st.session_state['train_results'] is not None:
     # 1. 从“保险箱”里取出所有数据
     res = st.session_state['train_results']
     
-    # 解包变量 (方便后面代码直接复用，不用改太多变量名)
     history_dict = res['history']
     model = res['model']
     X_test = res['X_test']
@@ -516,7 +515,7 @@ if st.session_state['train_results'] is not None:
     
     show_segment_analysis = use_voting_loss
     if not use_voting_loss:
-        st.caption("ℹ️ 提示：未开启投票训练，但可手动查看投票评估。")
+        st.caption(" 提示：未开启投票训练，但可手动查看投票评估。")
         # 【关键】这个 checkbox 点击后会刷新页面，但因为 train_results 还在，
         # 所以程序会再次跑进这个 if 块，正确显示结果。
         show_segment_analysis = st.checkbox("🔍 显示片段级平滑/投票评估", value=False)
