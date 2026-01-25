@@ -23,10 +23,7 @@ TARGET_LABELS = [1, 2, 3, 4, 5, 6, 7, 8]                       # 只取这8个�
 
 # 2. 实验变量 (Grid Search)
 MODELS_TO_TEST = [
-    ("Simple_CNN", model_lib.build_simple_cnn),
-    ("Advanced_CRNN", model_lib.build_advanced_crnn),
     ("TCN", model_lib.build_tcn_model),
-    ("ResNet1D", model_lib.build_resnet_model),
 ]
 
 OPTIMIZERS_TO_TEST = [
@@ -41,7 +38,7 @@ VOTING_OPTIONS = [False] # 是否开启投票
 CONFIG = {
     'fs': 2000,                # 采样率                  
     'epochs': 100,
-    'batch_size': 256,
+    'batch_size': 32,
     'test_size': 0.2,          # 测试集比例
     'split_strategy': "留文件验证 (同天/同人)",
     'label_smoothing': 0.1,    # 标签平滑

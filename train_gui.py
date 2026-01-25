@@ -186,6 +186,17 @@ with st.sidebar:
     
     with st.expander("数据增强与采样", expanded=False):
         train_window_ms = st.number_input("模型输入窗口 (Model Window ms)", 100, 1000, 350, step=10, help="输入神经网络的最终窗口大小")
+        use_center_crop = st.checkbox(
+            "禁用切片 (Center Crop Only)", 
+            value=True, 
+            help="启用后将与 new_auto_train.py 逻辑一致：每个动作仅截取中心的一个窗口，不再滑动生成多个切片。"
+        )
+        
+        if use_center_crop:
+            st.info("已启用 Center Crop 模式：步长设置已禁用 (每个动作产出 1 个样本)。")
+            train_stride_ms = 0 # 占位符，不会被使用
+        else:
+            train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 500, 350, step=10)
         train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 500, 350, step=10)
         st.caption("负样本策略")
         enable_rest = st.checkbox("加入静息类 (Rest, Label 0)", value=True)
@@ -320,7 +331,8 @@ if run_btn and target_files:
         augment_config=load_augment_config, 
         segmentation_config=seg_config,
         use_imu=use_imu,
-        window_ms=train_window_ms
+        window_ms=train_window_ms,
+        center_crop=use_center_crop
     )
     
     status_text.text("处理完成！")

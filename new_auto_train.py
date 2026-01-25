@@ -362,7 +362,7 @@ def process_files_with_rhythm(file_list, config, augment_config):
 
                     X_list.append(aug_win)
                     y_list.append(label)
-                    groups_list.append(f"{fname}_seg{seg_idx}_aug")
+                    groups_list.append(f"{fname}_seg{seg_idx}")
 
             # --- Rest (Silence) Processing (修改点 2: 随机抽取) ---
             if enable_rest:
@@ -454,30 +454,76 @@ def run_automation():
         print("❌ 未找到匹配文件")
         return
 
-    # 2. 生成数据 (使用新函数)
-    X, y, groups = process_files_with_rhythm(target_files, CONFIG, AUGMENT_CONFIG)
-    
-    if len(X) == 0:
-        print("❌ 样本数为0，请检查 rhythm_interval 或 文件的能量是否过低")
-        return
-        
-    # 3. 准备数据
-    # 映射 Label: 5,6,7,8 -> 1,2,3,4 (0预留给Rest)
-    unique_labels = sorted(np.unique(y))
-    label_map = {original: new for new, original in enumerate(unique_labels)}
-    y_mapped = np.array([label_map[i] for i in y])
-    
-    # Split
-    train_idx, test_idx = train_utils.smart_split(
-        X, y_mapped, groups, CONFIG['split_strategy'], test_size=CONFIG['test_size']
-    )
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y_mapped[train_idx], y_mapped[test_idx]
-    groups_train = groups[train_idx]
-    
-    print(f"📊 训练集: {X_train.shape}, 测试集: {X_test.shape}, 类别数: {len(unique_labels)}")
-    print(f"   Label Map: {label_map}")
+    from sklearn.model_selection import GroupShuffleSplit
 
+    # 1. 提取文件对应的 Group 信息用于划分
+    #    这里假设使用 CONFIG['split_strategy'] 中的逻辑
+    #    为了简单通用，这里演示最常用的 "留文件/留对象" 逻辑
+    
+    file_groups = []
+    for f in target_files:
+        subject, date, label, fname = parse_filename_info(f)
+        # 根据你的 split_strategy 设置 Group
+        if "对象" in CONFIG['split_strategy']: # 留对象验证
+            file_groups.append(subject)
+        elif "文件" in CONFIG['split_strategy']: # 留文件验证 (默认)
+            # 使用 subject_date 作为分组，或者直接用文件名(如果是纯随机留文件)
+            # 这里为了保险，模拟 "留文件验证 (同天/同人)"，即以文件为单位切分
+            file_groups.append(fname)
+        else:
+             # 混合切分下，其实很难在文件级完美做到，但按文件分通常没问题
+            file_groups.append(fname)
+
+    file_groups = np.array(file_groups)
+    file_indices = np.arange(len(target_files))
+
+    # 执行划分
+    gss = GroupShuffleSplit(n_splits=1, test_size=CONFIG['test_size'], random_state=42)
+    train_file_idx, test_file_idx = next(gss.split(file_indices, groups=file_groups))
+    
+    train_files = [target_files[i] for i in train_file_idx]
+    test_files = [target_files[i] for i in test_file_idx]
+    
+    print(f"文件划分完成: 训练集 {len(train_files)} 个文件 | 测试集 {len(test_files)} 个文件")
+
+    # 2. 分别加载数据
+    # [训练集]: 开启增强 (使用 AUGMENT_CONFIG)
+    print("\n--- 正在加载训练集 (启用增强) ---")
+    X_train, y_train, groups_train = process_files_with_rhythm(
+        train_files, CONFIG, AUGMENT_CONFIG
+    )
+    
+    # [测试集]: 关闭增强 (强制 multiplier=1)
+    print("\n--- 正在加载测试集 (禁用增强) ---")
+    test_aug_config = AUGMENT_CONFIG.copy()
+    test_aug_config['multiplier'] = 1  # 强制不倍增
+    test_aug_config['enable_noise'] = False # 强制关噪声
+    test_aug_config['enable_warp'] = False 
+    test_aug_config['enable_shift'] = False
+    test_aug_config['enable_mask'] = False
+    test_aug_config['enable_scaling'] = False
+    # 注意：test set 是否保留 rest(静息) 取决于你的评估需求，通常保留
+    
+    X_test, y_test, groups_test = process_files_with_rhythm(
+        test_files, CONFIG, test_aug_config
+    )
+    
+    if len(X_train) == 0 or len(X_test) == 0:
+        print("❌ 训练集或测试集样本数为0，退出。")
+        return
+
+    # 3. 标签映射 (Label Mapping)
+    # 必须基于两者的并集来生成 Map，防止某类动作只出现在 Test 而不在 Train (虽然概率小)
+    all_labels = np.unique(np.concatenate([y_train, y_test]))
+    label_map = {original: new for new, original in enumerate(all_labels)}
+    
+    y_train_mapped = np.array([label_map[i] for i in y_train])
+    y_test_mapped = np.array([label_map[i] for i in y_test])
+    
+    print(f"📊 最终数据集规模:")
+    print(f"   Train: {X_train.shape} (Augmented)")
+    print(f"   Test:  {X_test.shape} (Clean)")
+    print(f"   Labels: {label_map}")
     # 4. 训练循环
     MODELS_DIR = "1.25_trained_models_rhythm_wihoutstride"
     if not os.path.exists(MODELS_DIR): os.makedirs(MODELS_DIR)
@@ -485,8 +531,8 @@ def run_automation():
     total_exp = len(MODELS_TO_TEST) * len(OPTIMIZERS_TO_TEST) * len(VOTING_OPTIONS)
     curr_exp = 0
     
-    input_shape = (X.shape[1], X.shape[2])
-    num_classes = len(unique_labels)
+    input_shape = (X_train.shape[1], X_train.shape[2])
+    num_classes = len(label_map)
     
     for model_name, model_builder in MODELS_TO_TEST:
         for opt_name, opt_cls, lr, opt_kwargs in OPTIMIZERS_TO_TEST:

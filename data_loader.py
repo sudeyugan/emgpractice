@@ -478,18 +478,62 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
             action_samples_count = 0 
             
             for seg_idx, seg in enumerate(final_segments):
-                segment_data = data_clean[seg['start']:seg['end']]
+                # 获取该片段在 data_clean 中的绝对范围
+                seg_start_idx = seg['start']
+                seg_end_idx = seg['end']
                 
-                # Z-Score 归一化
-                seg_mean = np.mean(segment_data, axis=0)
-                seg_std = np.std(segment_data, axis=0)
-                segment_norm = (segment_data - seg_mean) / (seg_std + 1e-6)
+                # --- [新增逻辑] 模式 A: Center Crop (无切片) ---
+                if center_crop:
+                    # 1. 计算中心点
+                    center_idx = int((seg_start_idx + seg_end_idx) / 2)
+                    
+                    # 2. 计算需要的窗口范围
+                    half_win = current_window_size // 2
+                    w_start = center_idx - half_win
+                    w_end = w_start + current_window_size
+                    
+                    # 3. 边界处理 (Padding 逻辑移植自 new_auto_train.py)
+                    pad_left = 0
+                    pad_right = 0
+                    
+                    if w_start < 0:
+                        pad_left = -w_start
+                        w_start = 0
+                    if w_end > len(data_clean):
+                        pad_right = w_end - len(data_clean)
+                        w_end = len(data_clean)
+                    
+                    # 4. 截取数据
+                    window_data = data_clean[w_start : w_end]
+                    
+                    # 5. 零填充
+                    if pad_left > 0 or pad_right > 0:
+                        window_data = np.pad(window_data, ((pad_left, pad_right), (0, 0)), mode='constant', constant_values=0)
+                    
+                    # 6. Z-Score 归一化
+                    win_mean = np.mean(window_data, axis=0)
+                    win_std = np.std(window_data, axis=0)
+                    window_norm = (window_data - win_mean) / (win_std + 1e-6)
+                    
+                    # 放入列表 (作为唯一的窗口)
+                    windows_to_process = [window_norm]
                 
-                # 滑动窗口切片
-                # 注意：Peak 模式下，如果 segment 长度正好等于 peak_win_ms，且 stride 很小，可能只会产出几个切片
-                for w_start in range(0, len(segment_norm) - current_window_size + 1, current_stride_size):
-                    window = segment_norm[w_start : w_start + current_window_size]
+                # --- [旧逻辑] 模式 B: Sliding Window (滑动切片) ---
+                else:
+                    segment_data = data_clean[seg_start_idx : seg_end_idx]
+                    
+                    # Z-Score 归一化 (段内)
+                    seg_mean = np.mean(segment_data, axis=0)
+                    seg_std = np.std(segment_data, axis=0)
+                    segment_norm = (segment_data - seg_mean) / (seg_std + 1e-6)
+                    
+                    windows_to_process = []
+                    # 滑动窗口循环
+                    for w_start in range(0, len(segment_norm) - current_window_size + 1, current_stride_size):
+                        windows_to_process.append(segment_norm[w_start : w_start + current_window_size])
 
+                # --- 统一处理样本收集与增强 ---
+                for window in windows_to_process:
                     # 原始样本
                     X_list.append(window)
                     y_list.append(label)
