@@ -18,6 +18,55 @@ import ui_helper
 # 在顶部 import 区域加入
 from model import build_simple_cnn, build_advanced_crnn, build_resnet_model, build_tcn_model, build_dual_stream_model
 
+
+def augment_dataset_in_memory(X, y, groups, config, progress_bar=None):
+    multiplier = config.get('multiplier', 1)
+    if multiplier <= 1:
+        return X, y, groups
+    
+    X_aug_list, y_aug_list, groups_aug_list = [], [], []
+    total = len(X)
+    
+    # 提取增强配置
+    enable_warp = config.get('enable_warp', False)
+    enable_shift = config.get('enable_shift', False)
+    enable_scale = config.get('enable_scaling', False)
+    enable_mask = config.get('enable_mask', False)
+    enable_noise = config.get('enable_noise', False)
+    
+    for i in range(total):
+        # 1. 原始样本
+        X_aug_list.append(X[i])
+        y_aug_list.append(y[i])
+        groups_aug_list.append(groups[i])
+        
+        # 2. 生成副本
+        for _ in range(multiplier - 1):
+            aug_x = X[i].copy()
+            
+            # 调用 data_loader 中的函数
+            if enable_warp and np.random.random() > 0.5:
+                aug_x = data_loader.time_warp(aug_x)
+            if enable_shift and np.random.random() > 0.5:
+                aug_x = data_loader.time_shift(aug_x)
+            if enable_scale and np.random.random() > 0.3:
+                aug_x = data_loader.scale_amplitude(aug_x)
+            if enable_mask and np.random.random() > 0.7:
+                aug_x = data_loader.channel_mask(aug_x)
+            if enable_noise: 
+                aug_x = data_loader.add_noise(aug_x)
+                
+            X_aug_list.append(aug_x)
+            y_aug_list.append(y[i])
+            groups_aug_list.append(f"{groups[i]}_aug")
+        
+        if progress_bar and i % 50 == 0:
+            progress_bar.progress(i / total)
+            
+    if progress_bar: progress_bar.progress(1.0)
+    
+    return np.array(X_aug_list, dtype=np.float32), np.array(y_aug_list), np.array(groups_aug_list)
+
 # ================= 0. 全局设置 =================
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
@@ -44,6 +93,9 @@ base_model_path = None
 unfreeze_all = False
 if train_mode == "基于基模型微调 (Few-shot)":
     base_model_path = st.sidebar.file_uploader("上传基模型 (.h5/.keras)", type=["keras", "h5"])
+    base_model_name_str = "None"
+    if base_model_path:
+        base_model_name_str = base_model_path.name
 
     st.sidebar.markdown("---")
     st.sidebar.caption("微调策略")
@@ -104,6 +156,10 @@ with st.sidebar:
     
     st.info(f"已选中 **{len(target_files)}** 个 CSV 文件")
 
+    st.markdown("---")
+    st.header("1.5 传感器配置")
+    use_imu = st.checkbox("🧩 融合 IMU 数据 (6轴)", value=False)
+
     st.header("2. 增强与训练配置")
 
     with st.expander("✂️ 动作分割设置", expanded=True):
@@ -129,7 +185,8 @@ with st.sidebar:
             seg_config['peak_win_ms'] = seg_win
     
     with st.expander("数据增强与采样", expanded=False):
-        train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 200, 100, step=10)
+        train_window_ms = st.number_input("模型输入窗口 (Model Window ms)", 100, 1000, 350, step=10, help="输入神经网络的最终窗口大小")
+        train_stride_ms = st.slider("切片步长 (Stride ms)", 10, 500, 350, step=10)
         st.caption("负样本策略")
         enable_rest = st.checkbox("加入静息类 (Rest, Label 0)", value=True)
         st.caption("增强策略")
@@ -253,12 +310,17 @@ if run_btn and target_files:
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    load_augment_config = augment_config.copy()
+    load_augment_config['multiplier'] = 1 
+
     X, y, groups = data_loader.process_selected_files(
         target_files, 
         progress_callback=lambda p, t: (progress_bar.progress(p), status_text.text(t)),
         stride_ms=train_stride_ms,
-        augment_config=augment_config,
-        segmentation_config=seg_config
+        augment_config=load_augment_config, 
+        segmentation_config=seg_config,
+        use_imu=use_imu,
+        window_ms=train_window_ms
     )
     
     status_text.text("处理完成！")
@@ -302,6 +364,16 @@ if run_btn and target_files:
     y_train, y_test = y[train_idx], y[test_idx]
     groups_train = groups[train_idx] # 获取训练集的组信息，用于投票训练
     
+    if augment_config['multiplier'] > 1:
+        st.write(f"⚙️ 正在对训练集进行增强 (倍率: {augment_config['multiplier']}x)...")
+        aug_bar = st.progress(0)
+        X_train, y_train, groups_train = augment_dataset_in_memory(
+            X_train, y_train, groups_train, augment_config, progress_bar=aug_bar
+        )
+        st.success(f"增强后训练集规模: {X_train.shape}")
+    else:
+        st.write("未启用倍增增强。")
+
     unique_labels = np.unique(y)
     num_classes = len(unique_labels) 
     label_map = {original: new for new, original in enumerate(unique_labels)}
@@ -441,10 +513,12 @@ if run_btn and target_files:
         'y_pred': y_pred,
         'label_map': label_map,
         'class_names': [str(k) for k in label_map.keys()],
+        'train_mode': train_mode, 
+        'base_model_name': base_model_name_str,
         'optimizer_info': {
             'name': optimizer_name,
             'lr': learning_rate,
-            'params': opt_params # 这是我们在 UI 部分定义的那个字典
+            'params': opt_params
         }
     }
     
@@ -456,7 +530,10 @@ if st.session_state['train_results'] is not None:
     
     # 1. 从“保险箱”里取出所有数据
     res = st.session_state['train_results']
-    
+
+    curr_train_mode = res.get('train_mode', 'Unknown')
+    curr_base_model = res.get('base_model_name', 'None')
+
     history_dict = res['history']
     model = res['model']
     X_test = res['X_test']
@@ -566,7 +643,12 @@ if st.session_state['train_results'] is not None:
         
     # 2. 准备日志内容
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"{log_dir}/log_{current_time}_{model_choice.split(':')[0].strip()}.txt"
+    if "Few-shot" in curr_train_mode:
+        log_prefix = f"Finetune_{curr_base_model}"
+    else:
+        log_prefix = model_choice.split(':')[0].strip()
+
+    log_filename = f"{log_dir}/log_{current_time}_{log_prefix}.txt"
     
     # 收集最终指标
     final_train_acc = history_dict['accuracy'][-1]
@@ -580,6 +662,11 @@ if st.session_state['train_results'] is not None:
     log_content.append(f"   时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log_content.append(f"========================================\n")
     opt_info = res.get('optimizer_info', {'name': 'Unknown', 'lr': 0, 'params': {}})
+
+    log_content.append(f"[训练模式]")
+    log_content.append(f"模式: {curr_train_mode}")
+    if "Few-shot" in curr_train_mode:
+        log_content.append(f"基模型: {curr_base_model}")
     
     log_content.append(f"[1. 数据配置]")
     log_content.append(f"测试对象 (Subjects): {selected_subjects}")

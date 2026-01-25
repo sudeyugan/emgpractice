@@ -61,7 +61,7 @@ AUGMENT_CONFIG = {
     'enable_mask': False
 }
 
-LOG_DIR = "E1_auto_train_logs"
+LOG_DIR = "ninaDB2_E1_auto_train_logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
@@ -105,11 +105,9 @@ def process_mat_files(data_root="data40"):
             # 1. 获取 EMG 数据 (取前8列，并做特定的归一化)
             # 假设 emg 变量名就是 'emg'
             raw_emg = mat_data['emg'][:, :8] 
+            raw_emg = raw_emg[::2, :]
+            stimulus = mat_data['restimulus'].flatten()[::2]
             emg_data = raw_emg
-            
-            # 2. 获取标签 (restimulus)
-            # 也就是第 12 列 (如果从1开始数)，matlab里叫 restimulus
-            stimulus = mat_data['restimulus'].flatten()
 
             subj_act_X, subj_act_y, subj_act_groups = [], [], []
             subj_rest_X, subj_rest_y, subj_rest_groups = [], [], []
@@ -128,86 +126,82 @@ def process_mat_files(data_root="data40"):
             
             # 但更简单的方法可能是：利用 ndimage.label 找连通域（沿用你之前的思路）
             labeled_array, num_features = ndimage.label(stimulus > 0)
-            
+            WIN_RADIUS = 1500
             # --- 提取动作样本 ---
             for i in range(1, num_features + 1):
-                # 找到这个动作的所有索引
                 indices = np.where(labeled_array == i)[0]
-                
-                # 获取该段动作的标签 (取中位数值，防止边缘抖动)
                 current_label = int(np.median(stimulus[indices]))
                 
-                # 过滤：只取 1, 2, 5, 6
                 if current_label not in TARGET_LABELS:
                     continue
                 
-                # 找到中间行
                 center_idx = int((indices[0] + indices[-1]) / 2)
                 
-                # 上下各取 150 (范围：center-150 到 center+150)
-                start_win = center_idx - 150*20
-                end_win = center_idx + 150*20
+                start_win = center_idx - WIN_RADIUS
+                end_win = center_idx + WIN_RADIUS
                 
-                # 边界检查
                 if start_win < 0 or end_win > len(emg_data):
                     continue
                 
-                # 切片 (注意 Python 切片是左闭右开，所以 end_win 要不要+1取决于你想取300还是301点)
-                # "上下各150" 通常指 center 也是一个点，总共 150+1+150 = 301?
-                # 或者总共300? 这里暂取 [center-150 : center+150] (长度300)
                 window = emg_data[start_win:end_win]
                 
-                subj_act_X.append(window)
+                #  Instance Normalization (段内 Z-Score)
+                # 将任意量级的数据标准化到 均值0，方差1
+                mean = np.mean(window, axis=0)
+                std = np.std(window, axis=0)
+                std[std < 1e-8] = 1.0 # 防止除零
+                
+                window_norm = (window - mean) / std
+                
+                subj_act_X.append(window_norm)
                 subj_act_y.append(current_label)
-                subj_act_groups.append(f"{subject_name}_act_{i}") # 用于分组验证
+                subj_act_groups.append(f"{subject_name}_act_{i}")
                 
             # --- 提取静息样本 (Rest) ---
-            # 逻辑：找到 restimulus 为 0 的行，避开动作边缘
-            
-            # 1. 膨胀动作区域 (作为 Buffer)
-            # 比如我们要避开动作前后 100 行 (1秒)
-            buffer_size = 100*20
+            buffer_size = 100 * 10 # 降采样后 Buffer 也相应减半 (原 100*20)
             mask_active = stimulus > 0
-            # 膨胀：让动作区变大，这样非动作区(静息)就变小了，相当于做了 Erosion
             mask_forbidden = ndimage.binary_dilation(mask_active, structure=np.ones(buffer_size))
-            
-            mask_rest = ~mask_forbidden # 取反，得到安全的静息区
+            mask_rest = ~mask_forbidden 
             
             labeled_rest, num_rest = ndimage.label(mask_rest)
             
-            # 这里的逻辑可以灵活：每段静息区取几个切片？
-            # 简单起见，我们在每段足够长的静息区里，每隔一定距离切一个
             for i in range(1, num_rest + 1):
                 r_indices = np.where(labeled_rest == i)[0]
                 
-                # 如果这段静息太短 (小于 300)，就跳过
-                if len(r_indices) < 300*20: continue
+                # 长度检查 (原 300*20 -> 现 300*10)
+                if len(r_indices) < 300 * 10: continue
                 
-                # 在这段里切片，比如取中间，或者每隔 300 点切一个
-                # 这里演示：只取这段静息的最中间一段
                 center_idx = int((r_indices[0] + r_indices[-1]) / 2)
-                start_win = center_idx - 150*20
-                end_win = center_idx + 150*20
+                start_win = center_idx - WIN_RADIUS
+                end_win = center_idx + WIN_RADIUS
+                
+                if start_win < 0 or end_win > len(emg_data): continue
 
                 window = emg_data[start_win:end_win]
                 
-                subj_rest_X.append(window)
-                subj_rest_y.append(0) # Label 0
+                # 静息数据也要做同样的标准化，保证分布一致
+                mean = np.mean(window, axis=0)
+                std = np.std(window, axis=0)
+                std[std < 1e-8] = 1.0
+                window_norm = (window - mean) / std
+                
+                subj_rest_X.append(window_norm)
+                subj_rest_y.append(0) 
                 subj_rest_groups.append(f"{subject_name}_rest_{i}")
 
-
+            # 合并数据
             if len(subj_act_X) > 0:
-                # 1. 将动作数据直接加入主列表
                 X_list.extend(subj_act_X)
                 y_list.extend(subj_act_y)
                 groups_list.extend(subj_act_groups)
 
-                # 2. 计算合适的静息数量
-                # 策略：让静息总数 ≈ 单个动作类别的平均数量 (这样是完美的 1:1:1:1:1)
+                # 平衡静息样本
                 num_classes_found = len(np.unique(subj_act_y))
-                target_rest_count = int(len(subj_act_X) / num_classes_found) 
+                if num_classes_found > 0:
+                    target_rest_count = int(len(subj_act_X) / num_classes_found)
+                else:
+                    target_rest_count = 0
                 
-                # 3. 对静息数据进行随机采样
                 if len(subj_rest_X) > target_rest_count and target_rest_count > 0:
                     selected_indices = np.random.choice(len(subj_rest_X), target_rest_count, replace=False)
                     for idx in selected_indices:
@@ -215,16 +209,14 @@ def process_mat_files(data_root="data40"):
                         y_list.append(subj_rest_y[idx])
                         groups_list.append(subj_rest_groups[idx])
                 else:
-                    # 如果静息本来就不够，就全都要
                     X_list.extend(subj_rest_X)
                     y_list.extend(subj_rest_y)
                     groups_list.extend(subj_rest_groups)
 
-
         except Exception as e:
             print(f"❌ 处理出错 {mat_file}: {e}")
-            import traceback
-            traceback.print_exc()
+            # import traceback
+            # traceback.print_exc()
 
     return np.array(X_list), np.array(y_list), np.array(groups_list)
 
@@ -267,7 +259,7 @@ def run_automation():
     
     input_shape = (X.shape[1], X.shape[2])
 
-    MODELS_DIR = "40_E1_nina_trained_models"  
+    MODELS_DIR = "ninaDB2_trained_models"  
     if not os.path.exists(MODELS_DIR):
         os.makedirs(MODELS_DIR)
     

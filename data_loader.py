@@ -250,8 +250,47 @@ def scale_amplitude(data, scale_range=(0.8, 1.2)):
     factor = np.random.uniform(scale_range[0], scale_range[1])
     return data * factor
 
+def load_and_resample_imu(emg_filepath, target_length):
+    """
+    根据 EMG 文件路径查找对应的 IMU 文件，并将其重采样到 target_length (1000Hz)
+    """
+    # 假设文件名格式一致，只是前缀不同：RAW_EMG_... -> RAW_IMU_...
+    imu_filepath = emg_filepath.replace("RAW_EMG", "RAW_IMU")
+    
+    if not os.path.exists(imu_filepath):
+        # 尝试另一种常见情况：如果文件夹结构不同，可能需要更复杂的查找
+        # 这里假设它们在同一目录下
+        return None
 
-def process_selected_files(file_list, progress_callback=None, stride_ms=100, augment_config=None, segmentation_config=None):
+    try:
+        df = pd.read_csv(imu_filepath)
+        # 确保列名正确，根据你提供的文件内容: AX,AY,AZ,GX,GY,GZ
+        required_cols = ['AX', 'AY', 'AZ', 'GX', 'GY', 'GZ']
+        
+        # 检查列是否存在
+        if not all(col in df.columns for col in required_cols):
+            print(f"Warning: IMU file {os.path.basename(imu_filepath)} missing columns.")
+            return None
+            
+        imu_data = df[required_cols].values # Shape: (N_imu, 6)
+        
+        # --- 重采样逻辑 (200Hz -> 1000Hz) ---
+        # 使用线性插值将 IMU 数据拉伸到与 EMG 数据相同的长度 (target_length)
+        x_old = np.linspace(0, 1, len(imu_data))
+        x_new = np.linspace(0, 1, target_length)
+        
+        imu_resampled = np.zeros((target_length, 6))
+        for i in range(6):
+            imu_resampled[:, i] = np.interp(x_new, x_old, imu_data[:, i])
+            
+        return imu_resampled
+
+    except Exception as e:
+        print(f"Error loading IMU {imu_filepath}: {e}")
+        return None
+
+
+def process_selected_files(file_list, progress_callback=None, stride_ms=100, augment_config=None, segmentation_config=None, use_imu=False, window_ms=250):
     """
     核心处理流程：支持 VAD (阈值) 和 Peak (固定节奏) 两种模式
     """
@@ -296,6 +335,7 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
     
     current_stride_size = int(FS * (stride_ms / 1000))
     if current_stride_size < 1: current_stride_size = 1
+    current_window_size = int(FS * (window_ms / 1000))
     
     total = len(file_list)
     
@@ -309,23 +349,37 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
             
             df = pd.read_csv(f)
             cols = [c for c in df.columns if 'CH' in c]
+            raw_emg = df[cols].values
             raw_data = df[cols].values
-            
-            # --- 1. CH5 信号增益修正 ---
-            if raw_data.shape[1] >= 5:
-                raw_data[:, 4] = raw_data[:, 4] * 2.5
-                
+            if raw_emg.shape[1] >= 5: raw_emg[:, 4] = raw_emg[:, 4] * 2.5
+
+            if use_imu:
+                imu_data = load_and_resample_imu(f, len(raw_emg))
+                if imu_data is not None:
+                    # 拼接：EMG (N, 5) + IMU (N, 6) -> (N, 11)
+                    # 注意：此时 raw_data 变为了 11 通道
+                    raw_data = np.hstack((raw_emg, imu_data))
+                else:
+                    print(f"⚠️ Skip {os.path.basename(f)}: IMU file not found.")
+                    continue # 如果强制要求 IMU 但没找到，建议跳过该文件
+            else:
+                raw_data = raw_emg    
             # --- 2. 信号滤波链 ---
             data_proc = raw_data.copy()
+            emg_cols = raw_emg.shape[1]
             if ENABLE_NOTCH:
                 b_notch, a_notch = signal.iirnotch(NOTCH_FREQ, 30, FS)
-                data_proc = signal.filtfilt(b_notch, a_notch, data_proc, axis=0)
+                data_proc[:, :emg_cols] = signal.filtfilt(b_notch, a_notch, data_proc[:, :emg_cols], axis=0)
             
             b, a = signal.butter(4, [20, 450], btype='bandpass', fs=FS)
-            data_clean = signal.filtfilt(b, a, data_proc, axis=0)
+            data_proc[:, :emg_cols] = signal.filtfilt(b, a, data_proc[:, :emg_cols], axis=0)
             
-            # 计算能量
-            energy = np.sqrt(np.mean(data_clean**2, axis=1))
+            data_clean = data_proc # 此时 data_clean 包含了 滤波后的EMG + 原始(或插值后)的IMU
+            
+            # 计算能量 (仅使用 EMG 计算能量来做活动检测 VAD/Peak)
+            # 因为 IMU 在静止时可能有重力分量 (G=9.8)，直接算能量会导致 VAD 失效
+            emg_part = data_clean[:, :emg_cols]
+            energy = np.sqrt(np.mean(emg_part**2, axis=1))
             win_len = int((VAD_SMOOTH_MS/1000) * FS)
             energy_smooth = np.convolve(energy, np.ones(win_len)/win_len, mode='same')
             
@@ -433,9 +487,9 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
                 
                 # 滑动窗口切片
                 # 注意：Peak 模式下，如果 segment 长度正好等于 peak_win_ms，且 stride 很小，可能只会产出几个切片
-                for w_start in range(0, len(segment_norm) - WINDOW_SIZE + 1, current_stride_size):
-                    window = segment_norm[w_start : w_start + WINDOW_SIZE]
-                    
+                for w_start in range(0, len(segment_norm) - current_window_size + 1, current_stride_size):
+                    window = segment_norm[w_start : w_start + current_window_size]
+
                     # 原始样本
                     X_list.append(window)
                     y_list.append(label)
@@ -488,7 +542,7 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
                 for i in range(1, num_rest + 1):
                     r_indices = np.where(labeled_rest == i)[0]
                     # 长度检查
-                    if len(r_indices) > WINDOW_SIZE:
+                    if len(r_indices) > current_window_size:
                         r_seg_data = data_clean[r_indices[0]:r_indices[-1]]
                         
                         # Z-Score Norm
@@ -498,9 +552,9 @@ def process_selected_files(file_list, progress_callback=None, stride_ms=100, aug
                         r_seg_norm = (r_seg_data - r_mean) / (r_std + 1e-6)
                         
                         # 较大的步长采样，避免静息数据过于重复
-                        rest_stride = WINDOW_SIZE 
-                        for w_start in range(0, len(r_seg_norm) - WINDOW_SIZE, rest_stride):
-                            all_rest_windows.append(r_seg_norm[w_start : w_start + WINDOW_SIZE])
+                        rest_stride = current_window_size
+                        for w_start in range(0, len(r_seg_norm) - current_window_size, rest_stride):
+                            all_rest_windows.append(r_seg_norm[w_start : w_start + current_window_size])
 
                 if len(all_rest_windows) > 0:
                     # 随机打乱并抽取

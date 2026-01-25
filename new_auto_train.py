@@ -41,11 +41,50 @@ def channel_mask(data, mask_prob=0.15):
         temp[:, c] = 0
     return temp
 
+def load_and_resample_imu(emg_filepath, target_length):
+    """
+    根据 EMG 文件路径查找对应的 IMU 文件，并将其重采样到 target_length (1000Hz)
+    """
+    # 假设文件名格式一致，只是前缀不同：RAW_EMG_... -> RAW_IMU_...
+    imu_filepath = emg_filepath.replace("RAW_EMG", "RAW_IMU")
+    
+    if not os.path.exists(imu_filepath):
+        # 尝试另一种常见情况：如果文件夹结构不同，可能需要更复杂的查找
+        # 这里假设它们在同一目录下
+        return None
+
+    try:
+        df = pd.read_csv(imu_filepath)
+        # 确保列名正确，根据你提供的文件内容: AX,AY,AZ,GX,GY,GZ
+        required_cols = ['AX', 'AY', 'AZ', 'GX', 'GY', 'GZ']
+        
+        # 检查列是否存在
+        if not all(col in df.columns for col in required_cols):
+            print(f"Warning: IMU file {os.path.basename(imu_filepath)} missing columns.")
+            return None
+            
+        imu_data = df[required_cols].values # Shape: (N_imu, 6)
+        
+        # --- 重采样逻辑 (200Hz -> 1000Hz) ---
+        # 使用线性插值将 IMU 数据拉伸到与 EMG 数据相同的长度 (target_length)
+        x_old = np.linspace(0, 1, len(imu_data))
+        x_new = np.linspace(0, 1, target_length)
+        
+        imu_resampled = np.zeros((target_length, 6))
+        for i in range(6):
+            imu_resampled[:, i] = np.interp(x_new, x_old, imu_data[:, i])
+            
+        return imu_resampled
+
+    except Exception as e:
+        print(f"Error loading IMU {imu_filepath}: {e}")
+        return None
+
 # ==================== 0. 配置区域 ====================
 
 # 1. 目标设置
 TARGET_SUBJECTS = ["charles", "gavvin", "gerard", "giland", "jessie", "legend"] 
-TARGET_LABELS = [1, 3, 4, 5, 6, 7, 8, 9, 15]            # 指定动作标签
+TARGET_LABELS = [5, 6, 7, 8]            # 指定动作标签
 TARGET_DATES = None                     # None 表示所有日期
 
 # 2. 实验模型 (Grid Search)
@@ -66,12 +105,13 @@ VOTING_OPTIONS = [False] # 是否开启投票
 # 3. 核心参数 (Rhythm Logic)
 CONFIG = {
     'fs': 1000,                # 采样率
+    'use_imu': True,
     'rhythm_interval_ms': 4000,# [关键] 动作间隔 (节拍器速度)
-    'rhythm_window_ms': 350,   # [关键] 每次截取的窗口大小 (以峰值为中心)
+    'rhythm_window_ms': 352,   # [关键] 每次截取的窗口大小 (以峰值为中心)
     'epochs': 100,
     'batch_size': 128,
-    'window_ms': 250,          # 输入模型的窗口大小
-    'stride_ms': 50,           # 切片步长
+    'window_ms': 350,          # 输入模型的窗口大小
+    'stride_ms': 350,           # 切片步长
     'test_size': 0.2,
     'split_strategy': "混合切分 (看到所有天/人)", 
 }
@@ -87,7 +127,7 @@ AUGMENT_CONFIG = {
     'enable_mask': False
 }
 
-LOG_DIR = "1.24_9_auto_train_logs_rhythm"
+LOG_DIR = "1.25_auto_train_logs_rhythm_withoutstride"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
@@ -209,30 +249,47 @@ def process_files_with_rhythm(file_list, config, augment_config):
     total_act_samples = 0
     
     print(f"⏳ 正在处理 {len(file_list)} 个文件 (Mode: Rhythm Phase Voting)...")
-    
+    use_imu = config.get('use_imu', False)
     for i, f_path in enumerate(file_list):
         try:
             subject, date, label, fname = parse_filename_info(f_path)
             if label is None: continue
-            
-            # --- Load ---
+
             df = pd.read_csv(f_path)
             cols = [c for c in df.columns if 'CH' in c]
-            raw_data = df[cols].values
-            if raw_data.shape[1] >= 5: # CH5 fix
-                raw_data[:, 4] = raw_data[:, 4] * 2.5
+            raw_emg = df[cols].values
+            if raw_emg.shape[1] >= 5: raw_emg[:, 4] = raw_emg[:, 4] * 2.5
+            
+            # --- Load IMU & Merge ---
+            if use_imu:
+                imu_data = load_and_resample_imu(f_path, len(raw_emg))
+                if imu_data is not None:
+                    # 此时 raw_data 是 (N, 5+6)
+                    raw_data = np.hstack((raw_emg, imu_data))
+                else:
+                    print(f"⚠️ Skip {os.path.basename(f_path)}: IMU missing")
+                    continue
+            else:
+                raw_data = raw_emg
+                
+            emg_cols = raw_emg.shape[1] # 5
+            data_proc = raw_data.copy()
                 
             # --- Filter Chain ---
-            # 1. Notch
+             # 1. Notch (EMG only)
             b_notch, a_notch = signal.iirnotch(50, 30, fs)
-            data_notch = signal.filtfilt(b_notch, a_notch, raw_data, axis=0)
+            data_proc[:, :emg_cols] = signal.filtfilt(b_notch, a_notch, data_proc[:, :emg_cols], axis=0)
             
-            # 2. Bandpass
+            # 2. Bandpass (EMG only)
             b, a = signal.butter(4, [20, 450], btype='bandpass', fs=fs)
-            data_clean = signal.filtfilt(b, a, data_notch, axis=0)
+            data_clean = data_proc # 复制所有列
+            # 覆盖 EMG 列为滤波后的数据
+            data_clean[:, :emg_cols] = signal.filtfilt(b, a, data_proc[:, :emg_cols], axis=0)
             
-            # 3. Energy & Smooth (for Masking)
-            energy = np.sqrt(np.mean(data_clean**2, axis=1))
+            # 3. Energy (EMG only for Masking)
+            # 计算能量时只用 EMG，因为我们是根据肌肉发力来判断动作起止的
+            emg_part = data_clean[:, :emg_cols]
+            energy = np.sqrt(np.mean(emg_part**2, axis=1))
             win_len = int(0.1 * fs) # 100ms smooth
             energy_smooth = np.convolve(energy, np.ones(win_len)/win_len, mode='same')
             
@@ -398,7 +455,7 @@ def run_automation():
     print(f"   Label Map: {label_map}")
 
     # 4. 训练循环
-    MODELS_DIR = "1.24_9_trained_models_rhythm"
+    MODELS_DIR = "1.25_trained_models_rhythm_wihoutstride"
     if not os.path.exists(MODELS_DIR): os.makedirs(MODELS_DIR)
     
     total_exp = len(MODELS_TO_TEST) * len(OPTIMIZERS_TO_TEST) * len(VOTING_OPTIONS)
