@@ -88,9 +88,9 @@ def process_mat_files(data_root="data40"):
     # 1. 遍历 s1 到 s38
     for subject_id in range(1, 39):
         subject_name = f"s{subject_id}"
-        # 寻找对应的 E1 文件: data/s1/S1_A1_E1.mat
+        # 寻找对应的 E1 文件: data/s1/S1_E1_A1.mat
         folder_path = os.path.join(data_root, subject_name)
-        mat_file = os.path.join(folder_path, f"S{subject_id}_A1_E1.mat")
+        mat_file = os.path.join(folder_path, f"S{subject_id}_E1_A1.mat")
         
         if not os.path.exists(mat_file):
             print(f"⚠️ 跳过: 找不到 {mat_file}")
@@ -229,7 +229,7 @@ def run_automation():
     mock_status = MockStatusText()
     
     # 加载数据 (只加载一次，节省时间)
-    X, y, groups = process_mat_files(data_root="data")
+    X, y, groups = process_mat_files(data_root="data40")
     
     if len(X) == 0:
         print("❌ 生成样本数为 0，退出。")

@@ -119,7 +119,7 @@ CONFIG = {
 # 4. 数据增强
 AUGMENT_CONFIG = {
     'enable_rest': True,       # 是否采集静息数据 (Label 0)
-    'multiplier': 1,           # 数据倍增系数
+    'multiplier': 3,           # 数据倍增系数
     'enable_scaling': True,
     'enable_noise': True,
     'enable_warp': False,      # 时间扭曲 (耗时，视情况开启)
@@ -233,13 +233,14 @@ def get_rhythm_mask(energy, fs, interval_ms=4000, window_ms=300, noise_cv_thresh
 
 def process_files_with_rhythm(file_list, config, augment_config):
     """
-    使用固定节奏逻辑处理文件列表
+    修改版：取消切片 (No Slicing/Stride)
+    每个检测到的动作段只取中心的一个窗口作为样本。
     """
     X_list, y_list, groups_list = [], [], []
     
     fs = config['fs']
     win_size = int(fs * (config['window_ms'] / 1000))
-    stride = int(fs * (config['stride_ms'] / 1000))
+    # stride 变量不再需要，因为我们不再滑动
     
     # 增强参数
     multiplier = augment_config.get('multiplier', 1)
@@ -248,8 +249,9 @@ def process_files_with_rhythm(file_list, config, augment_config):
     # 用于计算静息样本比例
     total_act_samples = 0
     
-    print(f"⏳ 正在处理 {len(file_list)} 个文件 (Mode: Rhythm Phase Voting)...")
+    print(f"⏳ 正在处理 {len(file_list)} 个文件 (Mode: No Slicing, Center Crop)...")
     use_imu = config.get('use_imu', False)
+    
     for i, f_path in enumerate(file_list):
         try:
             subject, date, label, fname = parse_filename_info(f_path)
@@ -264,7 +266,6 @@ def process_files_with_rhythm(file_list, config, augment_config):
             if use_imu:
                 imu_data = load_and_resample_imu(f_path, len(raw_emg))
                 if imu_data is not None:
-                    # 此时 raw_data 是 (N, 5+6)
                     raw_data = np.hstack((raw_emg, imu_data))
                 else:
                     print(f"⚠️ Skip {os.path.basename(f_path)}: IMU missing")
@@ -272,28 +273,24 @@ def process_files_with_rhythm(file_list, config, augment_config):
             else:
                 raw_data = raw_emg
                 
-            emg_cols = raw_emg.shape[1] # 5
+            emg_cols = raw_emg.shape[1]
             data_proc = raw_data.copy()
                 
             # --- Filter Chain ---
-             # 1. Notch (EMG only)
             b_notch, a_notch = signal.iirnotch(50, 30, fs)
             data_proc[:, :emg_cols] = signal.filtfilt(b_notch, a_notch, data_proc[:, :emg_cols], axis=0)
             
-            # 2. Bandpass (EMG only)
             b, a = signal.butter(4, [20, 450], btype='bandpass', fs=fs)
-            data_clean = data_proc # 复制所有列
-            # 覆盖 EMG 列为滤波后的数据
+            data_clean = data_proc
             data_clean[:, :emg_cols] = signal.filtfilt(b, a, data_proc[:, :emg_cols], axis=0)
             
-            # 3. Energy (EMG only for Masking)
-            # 计算能量时只用 EMG，因为我们是根据肌肉发力来判断动作起止的
+            # Energy Calculation
             emg_part = data_clean[:, :emg_cols]
             energy = np.sqrt(np.mean(emg_part**2, axis=1))
-            win_len = int(0.1 * fs) # 100ms smooth
+            win_len = int(0.1 * fs)
             energy_smooth = np.convolve(energy, np.ones(win_len)/win_len, mode='same')
             
-            # --- New Core Logic ---
+            # --- Mask Logic ---
             mask = get_rhythm_mask(
                 energy_smooth, fs, 
                 interval_ms=config['rhythm_interval_ms'],
@@ -301,104 +298,131 @@ def process_files_with_rhythm(file_list, config, augment_config):
                 noise_cv_threshold=0.2
             )
             
-            # --- Slicing Active Segments ---
+            # --- Active Segments Processing ---
             labeled, num_seg = ndimage.label(mask)
             
             for seg_idx in range(1, num_seg + 1):
                 loc = np.where(labeled == seg_idx)[0]
-                if len(loc) < win_size: continue # 太短的不够切
+            
+                # 确保形状正确 (双重保险)
+                # 1. 找到该动作片段在原始数据中的中心点
+                center_idx = loc[0] + len(loc) // 2
                 
-                seg_data = data_clean[loc[0]:loc[-1]]
+                # 2. 计算需要的起始和结束位置 (在原始长数据 data_clean 中)
+                half_win = win_size // 2
+                w_start = center_idx - half_win
+                w_end = w_start + win_size
+                
+                # 3. 边界处理 (如果动作刚好在文件开头或结尾)
+                pad_left = 0
+                pad_right = 0
+                
+                if w_start < 0:
+                    pad_left = -w_start # 需要在左边补多少0
+                    w_start = 0
+                if w_end > len(data_clean):
+                    pad_right = w_end - len(data_clean) # 需要在右边补多少0
+                    w_end = len(data_clean)
+                
+                # 4. 从原始数据中截取 (这样就自动包含了动作周围的静息数据，补足了时长)
+                seg_data = data_clean[w_start : w_end]
+                
+                # 5. 如果碰到文件边缘导致长度不够，进行零填充 (Padding)
+                if pad_left > 0 or pad_right > 0:
+                    # ((pad_left, pad_right), (0, 0)) 表示只在时间维度(行)前后补零，通道维度(列)不补
+                    seg_data = np.pad(seg_data, ((pad_left, pad_right), (0, 0)), mode='constant', constant_values=0)
                 
                 # Z-Score Norm (Per segment)
                 seg_mean = np.mean(seg_data, axis=0)
                 seg_std = np.std(seg_data, axis=0)
                 seg_norm = (seg_data - seg_mean) / (seg_std + 1e-6)
                 
-                # Sliding Window
-                for w_start in range(0, len(seg_norm) - win_size + 1, stride):
-                    window = seg_norm[w_start : w_start + win_size]
-                    
-                    # Original
-                    X_list.append(window)
+                # 截取唯一窗口
+                window = seg_norm
+                
+                # Original
+                X_list.append(window)
+                y_list.append(label)
+                groups_list.append(f"{fname}_seg{seg_idx}")
+                total_act_samples += 1
+                
+                # Augmentation
+                for _ in range(multiplier - 1):
+                    aug_win = window.copy()
+                    if augment_config.get('enable_warp', False) and np.random.random() > 0.5:
+                        aug_win = time_warp(aug_win)
+                    if augment_config.get('enable_shift', False) and np.random.random() > 0.5:
+                        aug_win = time_shift(aug_win) # 这里的 shift 是 roll，不改变长度，仍然适用
+                    if augment_config.get('enable_scaling', True) and np.random.random() > 0.3:
+                            aug_win *= np.random.uniform(0.8, 1.2)
+                    if augment_config.get('enable_mask', False) and np.random.random() > 0.7:
+                        aug_win = channel_mask(aug_win)
+                    if augment_config.get('enable_noise', True):
+                        aug_win += np.random.normal(0, 0.02, aug_win.shape)
+
+                    X_list.append(aug_win)
                     y_list.append(label)
-                    groups_list.append(f"{fname}_seg{seg_idx}")
-                    total_act_samples += 1
-                    
-                    # Augmentation (Simple Noise/Scale for now)
-                    for _ in range(multiplier - 1):
-                        aug_win = window.copy()
+                    groups_list.append(f"{fname}_seg{seg_idx}_aug")
 
-                        if augment_config.get('enable_warp', False) and np.random.random() > 0.5:
-                            aug_win = time_warp(aug_win)
-                            
-                        # 2. 时间平移
-                        if augment_config.get('enable_shift', False) and np.random.random() > 0.5:
-                            aug_win = time_shift(aug_win)
-                            
-                        # 3. 幅度缩放
-                        if augment_config.get('enable_scaling', True) and np.random.random() > 0.3:
-                             aug_win *= np.random.uniform(0.8, 1.2)
-                             
-                        # 4. 通道遮挡
-                        if augment_config.get('enable_mask', False) and np.random.random() > 0.7:
-                            aug_win = channel_mask(aug_win)
-                            
-                        # 5. 高斯噪声 (通常最后加)
-                        if augment_config.get('enable_noise', True):
-                            aug_win += np.random.normal(0, 0.02, aug_win.shape)
-
-                        X_list.append(aug_win)
-                        y_list.append(label)
-                        groups_list.append(f"{fname}_seg{seg_idx}_aug")
-
-            # --- Slicing Rest (Silence) ---
+            # --- Rest (Silence) Processing (修改点 2: 随机抽取) ---
             if enable_rest:
-                # [修改] 改回使用能量阈值定义静息，而不是节奏 Mask 的补集
-                # 1. 重新计算一个宽泛的 VAD Mask (基于能量)
                 noise_floor = np.percentile(energy_smooth, 10)
                 peak_level = np.percentile(energy_smooth, 99)
-                # 阈值系数 0.15 是经验值，与 GUI 保持一致
                 vad_threshold = noise_floor + 0.15 * (peak_level - noise_floor)
-                
                 vad_mask = energy_smooth > vad_threshold
-                
-                # 2. 对 VAD Mask 取反，得到静息区
                 rest_mask = ~vad_mask
                 
-                # 3. 腐蚀 (Erosion) 确保远离动作边缘 (这里保持原样或稍微调大一点 margin)
-                safe_margin = int(0.15 * fs) # 150ms margin
+                safe_margin = int(0.15 * fs)
                 rest_mask = ndimage.binary_erosion(rest_mask, structure=np.ones(safe_margin))
                 
-                # 后面的逻辑保持不变...
                 labeled_rest, num_rest = ndimage.label(rest_mask)
-                # 随机抽取一定数量的 Rest，避免过多
-                target_rest = int(total_act_samples * 0.2) + 2 # 每文件约 20%
                 
-                rest_buffer = []
+                # 目标：静息样本数量为动作样本的 20%
+                target_rest = int(total_act_samples * 0.2) + 2
+                
+                # 收集所有足够长的静息段
+                valid_rest_segments = []
                 for r_idx in range(1, num_rest + 1):
                     r_loc = np.where(labeled_rest == r_idx)[0]
                     if len(r_loc) > win_size:
-                        r_data = data_clean[r_loc[0]:r_loc[-1]]
-                        # Norm
-                        r_mean = np.mean(r_data, axis=0)
-                        r_std = np.std(r_data, axis=0)
-                        r_std = np.where(r_std < 0.01, 1.0, r_std)
-                        r_norm = (r_data - r_mean) / (r_std + 1e-6)
-                        
-                        # Big Stride for rest
-                        for w_s in range(0, len(r_norm) - win_size, win_size):
-                            rest_buffer.append(r_norm[w_s:w_s+win_size])
+                        valid_rest_segments.append(data_clean[r_loc[0]:r_loc[-1]])
+                
+                # 从这些段中随机截取 target_rest 个样本
+                collected_rest = 0
+                retries = 0
+                max_retries = target_rest * 2 # 防止死循环
+                
+                if valid_rest_segments:
+                    while collected_rest < target_rest and retries < max_retries:
+                        # 随机选一个段
+                        seg = valid_rest_segments[np.random.randint(len(valid_rest_segments))]
+                        if len(seg) <= win_size:
+                            retries += 1
+                            continue
                             
-                if rest_buffer:
-                    np.random.shuffle(rest_buffer)
-                    for rw in rest_buffer[:target_rest]:
-                        X_list.append(rw)
-                        y_list.append(0) # Label 0
-                        groups_list.append(f"{fname}_rest")
+                        # 随机选一个起始点
+                        max_start = len(seg) - win_size
+                        if max_start <= 0: start_idx = 0
+                        else: start_idx = np.random.randint(0, max_start)
+                        
+                        r_raw_win = seg[start_idx : start_idx + win_size]
+                        
+                        # Norm
+                        r_mean = np.mean(r_raw_win, axis=0)
+                        r_std = np.std(r_raw_win, axis=0)
+                        r_std = np.where(r_std < 0.01, 1.0, r_std)
+                        r_norm = (r_raw_win - r_mean) / (r_std + 1e-6)
+                        
+                        X_list.append(r_norm)
+                        y_list.append(0)
+                        groups_list.append(f"{fname}_rest_{collected_rest}")
+                        collected_rest += 1
+                        retries += 1
 
         except Exception as e:
             print(f"Error reading {f_path}: {e}")
+            import traceback
+            traceback.print_exc()
             
     print(f"✅ 处理完成: 样本数 {len(X_list)}")
     return np.array(X_list), np.array(y_list), np.array(groups_list)
