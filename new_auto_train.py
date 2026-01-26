@@ -10,6 +10,7 @@ import scipy.signal as signal
 import scipy.ndimage as ndimage
 import tensorflow as tf
 from sklearn.metrics import classification_report
+from sklearn.model_selection import GroupShuffleSplit
 
 # 引用现有模块 (确保这些文件在同一目录下)
 import train_utils
@@ -79,6 +80,64 @@ def load_and_resample_imu(emg_filepath, target_length):
     except Exception as e:
         print(f"Error loading IMU {imu_filepath}: {e}")
         return None
+
+def augment_dataset_in_memory(X, y, groups, config):
+    """
+    在内存中对数据集进行增强。
+    X: (N, Time, Channels)
+    """
+    multiplier = config.get('multiplier', 1)
+    if multiplier <= 1:
+        return X, y, groups
+    
+    print(f"    ⚡ 正在执行内存增强 (倍率: {multiplier}x)...")
+    
+    X_aug_list, y_aug_list, groups_aug_list = [], [], []
+    total = len(X)
+    
+    # 提取配置
+    enable_warp = config.get('enable_warp', False)
+    enable_shift = config.get('enable_shift', False)
+    enable_scale = config.get('enable_scaling', False)
+    enable_mask = config.get('enable_mask', False)
+    enable_noise = config.get('enable_noise', False)
+    
+    for i in range(total):
+        # 1. 始终保留原始样本
+        X_aug_list.append(X[i])
+        y_aug_list.append(y[i])
+        groups_aug_list.append(groups[i])
+        
+        # 2. 生成 (multiplier - 1) 个增强副本
+        for _ in range(multiplier - 1):
+            aug_x = X[i].copy() # 必须 copy
+            
+            # 概率应用增强 (参数可根据需要微调)
+            if enable_warp and np.random.random() > 0.5:
+                aug_x = time_warp(aug_x)
+            
+            if enable_shift and np.random.random() > 0.5:
+                aug_x = time_shift(aug_x)
+                
+            if enable_scale and np.random.random() > 0.3:
+                # 简单的幅度缩放实现
+                factor = np.random.uniform(0.8, 1.2)
+                aug_x = aug_x * factor
+                
+            if enable_mask and np.random.random() > 0.7:
+                aug_x = channel_mask(aug_x)
+                
+            if enable_noise: 
+                # 高斯噪声
+                noise = np.random.normal(0, 0.02, aug_x.shape)
+                aug_x = aug_x + noise
+            
+            X_aug_list.append(aug_x)
+            y_aug_list.append(y[i])
+            # 增强样本共享同一个 Group ID，确保它们总是被分在一起（虽然这里是在 split 后增强，但保持 ID 一致是个好习惯）
+            groups_aug_list.append(groups[i]) 
+            
+    return np.array(X_aug_list, dtype=np.float32), np.array(y_aug_list), np.array(groups_aug_list)
 
 # ==================== 0. 配置区域 ====================
 
@@ -437,7 +496,7 @@ class MockStatusText:
 # ==================== 4. 主程序 ====================
 
 def run_automation():
-    # 1. 查找文件
+    # 1. 查找所有目标文件
     search_pattern = os.path.join("data", "*", "*", "RAW_EMG*.csv")
     all_files = glob.glob(search_pattern)
     target_files = []
@@ -454,75 +513,69 @@ def run_automation():
         print("❌ 未找到匹配文件")
         return
 
-    from sklearn.model_selection import GroupShuffleSplit
-
-    # 1. 提取文件对应的 Group 信息用于划分
-    #    这里假设使用 CONFIG['split_strategy'] 中的逻辑
-    #    为了简单通用，这里演示最常用的 "留文件/留对象" 逻辑
+    # === 关键修改步骤 1: 加载所有数据 (Clean Load) ===
+    print(f"⏳ 正在加载所有数据 (共 {len(target_files)} 个文件)...")
     
-    file_groups = []
-    for f in target_files:
-        subject, date, label, fname = parse_filename_info(f)
-        # 根据你的 split_strategy 设置 Group
-        if "对象" in CONFIG['split_strategy']: # 留对象验证
-            file_groups.append(subject)
-        elif "文件" in CONFIG['split_strategy']: # 留文件验证 (默认)
-            # 使用 subject_date 作为分组，或者直接用文件名(如果是纯随机留文件)
-            # 这里为了保险，模拟 "留文件验证 (同天/同人)"，即以文件为单位切分
-            file_groups.append(fname)
-        else:
-             # 混合切分下，其实很难在文件级完美做到，但按文件分通常没问题
-            file_groups.append(fname)
-
-    file_groups = np.array(file_groups)
-    file_indices = np.arange(len(target_files))
-
-    # 执行划分
-    gss = GroupShuffleSplit(n_splits=1, test_size=CONFIG['test_size'], random_state=42)
-    train_file_idx, test_file_idx = next(gss.split(file_indices, groups=file_groups))
+    # 创建一个“纯净”的配置，强制 multiplier=1，关闭所有增强
+    # 这样我们只加载最原始的数据
+    clean_config = AUGMENT_CONFIG.copy()
+    clean_config['multiplier'] = 1
+    clean_config['enable_noise'] = False
+    clean_config['enable_warp'] = False
+    clean_config['enable_shift'] = False
+    clean_config['enable_mask'] = False
+    clean_config['enable_scaling'] = False
+    # 注意：enable_rest 保持原样，因为我们需要静息数据
     
-    train_files = [target_files[i] for i in train_file_idx]
-    test_files = [target_files[i] for i in test_file_idx]
-    
-    print(f"文件划分完成: 训练集 {len(train_files)} 个文件 | 测试集 {len(test_files)} 个文件")
-
-    # 2. 分别加载数据
-    # [训练集]: 开启增强 (使用 AUGMENT_CONFIG)
-    print("\n--- 正在加载训练集 (启用增强) ---")
-    X_train, y_train, groups_train = process_files_with_rhythm(
-        train_files, CONFIG, AUGMENT_CONFIG
+    X_all, y_all, groups_all = process_files_with_rhythm(
+        target_files, CONFIG, clean_config
     )
     
-    # [测试集]: 关闭增强 (强制 multiplier=1)
-    print("\n--- 正在加载测试集 (禁用增强) ---")
-    test_aug_config = AUGMENT_CONFIG.copy()
-    test_aug_config['multiplier'] = 1  # 强制不倍增
-    test_aug_config['enable_noise'] = False # 强制关噪声
-    test_aug_config['enable_warp'] = False 
-    test_aug_config['enable_shift'] = False
-    test_aug_config['enable_mask'] = False
-    test_aug_config['enable_scaling'] = False
-    # 注意：test set 是否保留 rest(静息) 取决于你的评估需求，通常保留
-    
-    X_test, y_test, groups_test = process_files_with_rhythm(
-        test_files, CONFIG, test_aug_config
-    )
-    
-    if len(X_train) == 0 or len(X_test) == 0:
-        print("❌ 训练集或测试集样本数为0，退出。")
+    if len(X_all) == 0:
+        print("❌ 加载数据为空，退出。")
         return
 
+    print(f"✅ 原始数据加载完毕: {X_all.shape}")
+
+    # === 关键修改步骤 2: 样本级混合切分 (GroupShuffleSplit) ===
+    # GroupShuffleSplit 会保证同一个 Group (即同一个动作的所有切片) 不会被拆分到 train 和 test
+    # 由于我们还没有增强，现在的 Group 就是原始动作 ID (e.g., "filename_seg1")
+    
+    print(f"✂️ 正在执行混合切分 (Test Size: {CONFIG['test_size']})...")
+    
+    gss = GroupShuffleSplit(n_splits=1, test_size=CONFIG['test_size'], random_state=42)
+    train_idx, test_idx = next(gss.split(X_all, y_all, groups=groups_all))
+    
+    X_train_raw, y_train_raw = X_all[train_idx], y_all[train_idx]
+    X_test, y_test = X_all[test_idx], y_all[test_idx]
+    
+    # 保存训练集的 Groups 信息，稍后增强时要用
+    groups_train_raw = groups_all[train_idx]
+    
+    print(f"   Train (Raw): {X_train_raw.shape}")
+    print(f"   Test  (Clean): {X_test.shape}")
+
+    # === 关键修改步骤 3: 仅对训练集进行内存增强 ===
+    # 此时使用全局定义的 AUGMENT_CONFIG (里面包含了 multiplier, noise 等设置)
+    
+    if AUGMENT_CONFIG.get('multiplier', 1) > 1 or AUGMENT_CONFIG.get('enable_noise', False):
+        print("🚀 正在对训练集应用数据增强...")
+        X_train, y_train, groups_train = augment_dataset_in_memory(
+            X_train_raw, y_train_raw, groups_train_raw, AUGMENT_CONFIG
+        )
+    else:
+        X_train, y_train, groups_train = X_train_raw, y_train_raw, groups_train_raw
+    
     # 3. 标签映射 (Label Mapping)
-    # 必须基于两者的并集来生成 Map，防止某类动作只出现在 Test 而不在 Train (虽然概率小)
     all_labels = np.unique(np.concatenate([y_train, y_test]))
     label_map = {original: new for new, original in enumerate(all_labels)}
     
     y_train_mapped = np.array([label_map[i] for i in y_train])
     y_test_mapped = np.array([label_map[i] for i in y_test])
     
-    print(f"📊 最终数据集规模:")
-    print(f"   Train: {X_train.shape} (Augmented)")
-    print(f"   Test:  {X_test.shape} (Clean)")
+    print(f"📊 最终数据集规模 (Ready for Training):")
+    print(f"   Train: {X_train.shape} [Augmented]")
+    print(f"   Test:  {X_test.shape} [Clean]")
     print(f"   Labels: {label_map}")
     # 4. 训练循环
     MODELS_DIR = "1.25_trained_models_rhythm_wihoutstride"
@@ -553,8 +606,8 @@ def run_automation():
                 start_t = time.time()
                 try:
                     history = train_utils.train_with_voting_mechanism(
-                        model, X_train, y_train, groups_train,
-                        X_test, y_test,
+                        model, X_train, y_train_mapped, groups_train,
+                        X_test, y_test_mapped,
                         epochs=current_epochs,
                         batch_size=CONFIG['batch_size'],
                         samples_per_group=3,
@@ -579,7 +632,7 @@ def run_automation():
                     model, 
                     history, 
                     X_test, 
-                    y_test, 
+                    y_test_mapped, 
                     label_map, 
                     duration,
                     opt_name,       # 传入优化器名称

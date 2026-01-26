@@ -23,7 +23,9 @@ TARGET_LABELS = [1, 2, 3, 4, 5, 6, 7, 8]                       # 只取这8个�
 
 # 2. 实验变量 (Grid Search)
 MODELS_TO_TEST = [
+    ("Advanced_CRNN", model_lib.build_advanced_crnn),
     ("TCN", model_lib.build_tcn_model),
+    ("ResNet1D", model_lib.build_resnet_model),
 ]
 
 OPTIMIZERS_TO_TEST = [
@@ -50,7 +52,7 @@ CONFIG = {
 # 4. 数据增强配置 (幅度缩放 + 高斯噪声)
 AUGMENT_CONFIG = {
     'enable_rest': True,       # 加入静息
-    'multiplier': 1,           # 自动化测试通常不无限倍增，设为1或2即可，或者按需调整
+    'multiplier': 3,           # 自动化测试通常不无限倍增，设为1或2即可，或者按需调整
     'enable_scaling': True,    # 幅度缩放
     'enable_noise': True,      # 高斯噪声
     'enable_warp': False,

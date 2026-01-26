@@ -290,7 +290,7 @@ def load_and_resample_imu(emg_filepath, target_length):
         return None
 
 
-def process_selected_files(file_list, progress_callback=None, stride_ms=100, augment_config=None, segmentation_config=None, use_imu=False, window_ms=250):
+def process_selected_files(file_list, progress_callback=None, stride_ms=100, augment_config=None, segmentation_config=None, use_imu=False, window_ms=250, center_crop=False):
     """
     核心处理流程：支持 VAD (阈值) 和 Peak (固定节奏) 两种模式
     """
