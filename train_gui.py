@@ -428,17 +428,22 @@ if run_btn and target_files:
                 st.success(f"已加载模型用于 SGD 微调，所有层均可训练。")
                 
             else:
-                # 策略 B: Few-shot (冻结特征提取器) - 保持你原来的代码
+                # 策略 B: Few-shot (冻结特征提取器)
                 base_model.trainable = False 
                 
-                feature_output = None
-                for layer in reversed(base_model.layers):
-                    if "global_average_pooling" in layer.name or "flatten" in layer.name:
-                        feature_output = layer.output
-                        break
-                if feature_output is None: feature_output = base_model.layers[-3].output
+                # 我们假设最后一层是 Dense(softmax)。
+                # 我们需要它之前的层（通常是 Dense(64), Dropout, 或 LSTM）的特征。
+                feature_output = base_model.layers[-2].output
                 
-                x = feature_output
+                # 可选：双重检查输出是 3D (时间序列) 还是 2D (特征向量)
+                # 如果仍然是 3D (例如如果我们切在池化层之前)，我们需要将其展平。
+                if len(feature_output.shape) == 3:
+                     x = tf.keras.layers.GlobalAveragePooling1D()(feature_output)
+                else:
+                     x = feature_output
+                # -----------------------------------------------------------------
+
+                # 添加新的分类头
                 x = tf.keras.layers.Dropout(0.5, name="ft_dropout_1")(x) 
                 x = tf.keras.layers.Dense(64, activation='relu', 
                                           kernel_regularizer=tf.keras.regularizers.l2(0.01),

@@ -81,7 +81,7 @@ def build_simple_cnn(input_shape, num_classes):
     
     x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dense(64, activation='relu')(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    outputs = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
     
     model = models.Model(inputs=inputs, outputs=outputs, name="Simple_CNN")
     return model
@@ -124,7 +124,7 @@ def build_advanced_crnn(input_shape, num_classes):
     
     # 分类头
     x = layers.Dense(64, activation='relu')(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    outputs = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
     
     model = models.Model(inputs=inputs, outputs=outputs, name="Advanced_CRNN_SE")
     return model
@@ -146,7 +146,7 @@ def build_resnet_model(input_shape, num_classes):
     x = residual_block(x, 256)
     
     x = layers.GlobalAveragePooling1D()(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    outputs = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
     return models.Model(inputs, outputs, name="ResNet1D")
 
 def build_tcn_model(input_shape, num_classes):
@@ -177,7 +177,7 @@ def build_tcn_model(input_shape, num_classes):
     # 分类头
     x = layers.Dense(128, activation='relu')(x) # 加一层 Dense 增加非线性能力
     x = layers.Dropout(0.3)(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    outputs = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
     
     return models.Model(inputs, outputs, name="Optimized_TCN")
 def build_dual_stream_model(input_shape, num_classes):

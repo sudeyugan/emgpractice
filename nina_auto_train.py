@@ -10,11 +10,14 @@ import tensorflow as tf
 from sklearn.metrics import classification_report
 import scipy.ndimage as ndimage
 import gc
+from tensorflow.keras import mixed_precision
 
 # 引用现有模块
 import train_utils
 import nina_model as model_lib  # 避免变量名冲突
 
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
 # ==================== 0. 配置区域 (根据需求修改) ====================
 
 # 1. 目标设置
@@ -38,7 +41,7 @@ VOTING_OPTIONS = [False] # 是否开启投票
 
 # 3. 固定参数
 CONFIG = {
-    'fs': 2000,                # 采样率                  
+    'fs': 1000,                # 采样率                  
     'epochs': 100,
     'batch_size': 32,
     'test_size': 0.2,          # 测试集比例
