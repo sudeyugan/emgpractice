@@ -143,7 +143,7 @@ def augment_dataset_in_memory(X, y, groups, config):
 
 # 1. 目标设置
 TARGET_SUBJECTS = ["charles", "gavvin", "gerard", "giland", "jessie", "legend"] 
-TARGET_LABELS = [5, 6, 7, 8]            # 指定动作标签
+TARGET_LABELS = [5, 6, 8]            # 指定动作标签
 TARGET_DATES = None                     # None 表示所有日期
 
 # 2. 实验模型 (Grid Search)
@@ -186,7 +186,7 @@ AUGMENT_CONFIG = {
     'enable_mask': False
 }
 
-LOG_DIR = "1.25_auto_train_logs_rhythm_withoutstride"
+LOG_DIR = "1.26_auto_train_logs_rhythm_withoutstride"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
@@ -312,6 +312,7 @@ def process_files_with_rhythm(file_list, config, augment_config):
     use_imu = config.get('use_imu', False)
     
     for i, f_path in enumerate(file_list):
+        current_file_act_count = 0
         try:
             subject, date, label, fname = parse_filename_info(f_path)
             if label is None: continue
@@ -401,6 +402,7 @@ def process_files_with_rhythm(file_list, config, augment_config):
                 
                 # Original
                 X_list.append(window)
+                current_file_act_count += 1
                 y_list.append(label)
                 groups_list.append(f"{fname}_seg{seg_idx}")
                 total_act_samples += 1
@@ -437,7 +439,7 @@ def process_files_with_rhythm(file_list, config, augment_config):
                 labeled_rest, num_rest = ndimage.label(rest_mask)
                 
                 # 目标：静息样本数量为动作样本的 20%
-                target_rest = int(total_act_samples * 0.2) + 2
+                target_rest = int(current_file_act_count * 0.2) + 2
                 
                 # 收集所有足够长的静息段
                 valid_rest_segments = []
@@ -578,7 +580,7 @@ def run_automation():
     print(f"   Test:  {X_test.shape} [Clean]")
     print(f"   Labels: {label_map}")
     # 4. 训练循环
-    MODELS_DIR = "1.25_trained_models_rhythm_wihoutstride"
+    MODELS_DIR = "1.26_trained_models_rhythm_wihoutstride"
     if not os.path.exists(MODELS_DIR): os.makedirs(MODELS_DIR)
     
     total_exp = len(MODELS_TO_TEST) * len(OPTIMIZERS_TO_TEST) * len(VOTING_OPTIONS)
