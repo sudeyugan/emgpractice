@@ -8,7 +8,7 @@ class CHT:
         self.sparsity = sparsity
         self.remove_method = remove_method
         self.regrow_method = regrow_method
-        self.mum_epoch = mum_epoch
+        self.num_epoch = mum_epoch
         self.zeta = zeta
         self.chain_removal_list = chain_removal_list
         self.non_sparse_layer_list = non_sparse_layer_list

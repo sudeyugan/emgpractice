@@ -36,7 +36,7 @@ CONFIG = {
     'rhythm_interval_ms': 4000,
     'rhythm_window_ms': 352,
     'epochs': 100,             # CHT 稀疏训练通常需要较多轮次来演化
-    'batch_size': 64,          # PyTorch 常用 batch size
+    'batch_size': 128,          # PyTorch 常用 batch size
     'window_ms': 350,
     'test_size': 0.2,
     'learning_rate': 0.001,
@@ -64,7 +64,7 @@ AUGMENT_CONFIG = {
     'enable_mask': False
 }
 
-LOG_DIR = "1.26_auto_train_logs_pytorch_tcn"
+LOG_DIR = "sparse_train_logs_pytorch_tcn"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
@@ -212,9 +212,11 @@ def process_files(file_list, config, augment_config):
             
             df = pd.read_csv(f_path)
             cols = [c for c in df.columns if 'CH' in c]
-            raw_emg = df[cols].values
-            if raw_emg.shape[1] >= 5: raw_emg[:, 4] *= 2.5
+            raw_emg = df[cols].values.astype(np.float32) 
             
+            if raw_emg.shape[1] >= 5: 
+                raw_emg[:, 4] *= 2.5
+
             if use_imu:
                 imu_data = load_and_resample_imu(f_path, len(raw_emg))
                 if imu_data is not None: raw_data = np.hstack((raw_emg, imu_data))
@@ -300,8 +302,8 @@ def run_training_loop(model, train_loader, test_loader, config, label_map):
     device = torch.device(config['device'])
     model = model.to(device)
     
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.NAdam(model.parameters(), lr=config['learning_rate'])
     
     # === 初始化 CHT 稀疏训练器 ===
     cht = None
@@ -321,6 +323,8 @@ def run_training_loop(model, train_loader, test_loader, config, label_map):
     
     print(f"🚀 开始训练 (Device: {device})")
     start_time = time.time()
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    best_model_name = f"best_model_{timestamp}.pth"
     
     best_acc = 0.0
     
@@ -380,8 +384,8 @@ def run_training_loop(model, train_loader, test_loader, config, label_map):
         if val_acc > best_acc:
             best_acc = val_acc
             # 保存最佳模型
-            torch.save(model.state_dict(), os.path.join(LOG_DIR, "best_model.pth"))
-            
+            save_path = os.path.join(LOG_DIR, best_model_name)
+            torch.save(model.state_dict(), save_path)
         print(f"Epoch [{epoch+1}/{config['epochs']}] "
               f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
               f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
